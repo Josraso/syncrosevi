@@ -1,0 +1,123 @@
+/**
+ * 2024 SyncroSevi
+ * 
+ * Estilos CSS para el panel de administración - OPTIMIZADO
+ */
+
+/* Panel principal */
+.syncrosevi-panel {
+    margin-bottom: 20px;
+}
+
+.syncrosevi-panel .panel-heading {
+    background-color: #367fa9;
+    color: white;
+    border-color: #367fa9;
+}
+
+/* Estados */
+.badge-success {
+    background-color: #5cb85c;
+}
+
+.badge-danger {
+    background-color: #d9534f;
+}
+
+.badge-warning {
+    background-color: #f0ad4e;
+}
+
+.badge-info {
+    background-color: #5bc0de;
+}
+
+/* Búsqueda de clientes */
+.customer-search {
+    position: relative;
+}
+
+.customer-results {
+    position: absolute;
+    top: 100%;
+    left: 0;
+    right: 0;
+    background: white;
+    border: 1px solid #ddd;
+    max-height: 200px;
+    overflow-y: auto;
+    z-index: 1000;
+    display: none;
+}
+
+.customer-item {
+    padding: 10px;
+    cursor: pointer;
+    border-bottom: 1px solid #eee;
+}
+
+.customer-item:hover {
+    background: #f5f5f5;
+}
+
+/* Opciones de transporte */
+.transport-options {
+    display: none;
+    margin-top: 10px;
+}
+
+/* Estados a importar */
+.import-states-container {
+    max-height: 150px;
+    overflow-y: auto;
+    border: 1px solid #ddd;
+    padding: 10px;
+    margin-top: 10px;
+    display: none;
+}
+
+/* Formularios */
+.form-control:focus {
+    border-color: #367fa9;
+    box-shadow: 0 0 0 0.2rem rgba(54, 127, 169, 0.25);
+}
+
+/* Botones */
+.btn-group .btn {
+    margin-right: 2px;
+}
+
+/* Tabla de tiendas */
+.shop-row:hover {
+    background-color: #f9f9f9;
+}
+
+/* URLs para webhook */
+.webhook-url {
+    background: #f5f5f5;
+    padding: 10px;
+    font-family: monospace;
+    border: 1px solid #ddd;
+    word-break: break-all;
+}
+
+/* Responsive */
+@media (max-width: 768px) {
+    .btn-group .btn {
+        margin-bottom: 5px;
+    }
+    
+    .table-responsive {
+        border: none;
+    }
+}
+
+/* Animaciones */
+.fade-in {
+    animation: fadeIn 0.3s ease-in;
+}
+
+@keyframes fadeIn {
+    from { opacity: 0; }
+    to { opacity: 1; }
+}
