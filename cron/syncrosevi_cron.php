@@ -13,18 +13,22 @@
 
 /**
  * Archivo CORREGIDO para ejecutar las tareas programadas de SyncroSevi
- * 
+ *
  * CRONS SEPARADOS:
- * 
+ *
  * Para SOLO sincronizar pedidos (cada 15 minutos):
  * */15 * * * * /usr/bin/php /ruta/a/prestashop/modules/syncrosevi/cron/syncrosevi_cron.php sync
- * 
+ *
  * Para SOLO procesar pedidos (cada hora):
  * 0 * * * * /usr/bin/php /ruta/a/prestashop/modules/syncrosevi/cron/syncrosevi_cron.php process
- * 
+ *
+ * Para SOLO procesar pedidos CON LÍMITE (procesa máximo 5 tiendas, evita saturación):
+ * */30 * * * * /usr/bin/php /ruta/a/prestashop/modules/syncrosevi/cron/syncrosevi_cron.php process 5 60
+ * (Parámetros: número de tiendas a procesar, tiempo máximo en segundos)
+ *
  * Para obtener estadísticas:
  * 0 8 * * * /usr/bin/php /ruta/a/prestashop/modules/syncrosevi/cron/syncrosevi_cron.php stats
- * 
+ *
  * Para verificar salud de tiendas:
  * 0 9 * * 1 /usr/bin/php /ruta/a/prestashop/modules/syncrosevi/cron/syncrosevi_cron.php health
  */
@@ -111,17 +115,27 @@ class SyncroSeviCron
     
     /**
      * Ejecutar SOLO procesamiento de pedidos
+     *
+     * @param int $batchSize Número máximo de tiendas a procesar (0 = todas)
+     * @param int $maxExecutionTime Tiempo máximo en segundos (0 = sin límite)
      */
-    public function processOrders()
+    public function processOrders($batchSize = 0, $maxExecutionTime = 0)
     {
         $this->log("=== INICIANDO PROCESAMIENTO DE PEDIDOS ===");
-        
+
+        if ($batchSize > 0) {
+            $this->log("Modo BATCH activado: máximo {$batchSize} tiendas por ejecución");
+        }
+        if ($maxExecutionTime > 0) {
+            $this->log("Tiempo máximo: {$maxExecutionTime} segundos");
+        }
+
         try {
-            $results = $this->module->processOrders();
-            
+            $results = $this->module->processOrders($batchSize, $maxExecutionTime);
+
             $totalProcessed = 0;
             $errors = [];
-            
+
             foreach ($results as $result) {
                 if ($result['status'] == 'success') {
                     $totalProcessed++;
@@ -130,15 +144,17 @@ class SyncroSeviCron
                     } else {
                         $this->log("✓ " . $result['shop'] . ": " . ($result['message'] ?: 'Procesado correctamente'));
                     }
+                } elseif ($result['status'] == 'info') {
+                    $this->log("ℹ " . $result['shop'] . ": " . $result['message']);
                 } else {
                     $errors[] = $result['shop'] . ": " . $result['message'];
                     $this->log("✗ " . $result['shop'] . ": Error - " . $result['message']);
                 }
             }
-            
+
             $this->log("=== PROCESAMIENTO COMPLETADO ===");
             $this->log("Total procesados: {$totalProcessed} pedidos");
-            
+
             if (!empty($errors)) {
                 $this->log("Errores encontrados: " . count($errors));
                 foreach ($errors as $error) {
@@ -146,9 +162,9 @@ class SyncroSeviCron
                 }
                 return false;
             }
-            
+
             return true;
-            
+
         } catch (Exception $e) {
             $this->log("ERROR CRÍTICO en procesamiento: " . $e->getMessage());
             return false;
@@ -277,49 +293,55 @@ class SyncroSeviCron
 function main($args)
 {
     if (empty($args[1])) {
-        echo "Uso: php syncrosevi_cron.php [sync|process|stats|health]\n";
+        echo "Uso: php syncrosevi_cron.php [sync|process|stats|health] [opciones]\n";
         echo "\n";
         echo "Comandos disponibles:\n";
         echo "  sync    - SOLO sincronizar pedidos desde tiendas hijas\n";
         echo "  process - SOLO procesar pedidos pendientes\n";
+        echo "            Opciones: [batch_size] [max_time_seconds]\n";
+        echo "            Ejemplo: process 5 60 (procesa 5 tiendas, máx 60 seg)\n";
         echo "  stats   - Mostrar estadísticas del sistema\n";
         echo "  health  - Verificar estado de conexión de tiendas\n";
         echo "\n";
         echo "EJEMPLO DE CRONS SEPARADOS:\n";
         echo "*/15 * * * * php /ruta/syncrosevi_cron.php sync\n";
         echo "0 * * * * php /ruta/syncrosevi_cron.php process\n";
+        echo "*/30 * * * * php /ruta/syncrosevi_cron.php process 5 60\n";
         exit(1);
     }
-    
+
     $cron = new SyncroSeviCron();
     $command = $args[1];
     $success = true;
-    
+
     switch ($command) {
         case 'sync':
             $success = $cron->syncOrders();
             break;
-            
+
         case 'process':
-            $success = $cron->processOrders();
+            // Obtener parámetros opcionales para procesamiento por lotes
+            $batchSize = isset($args[2]) ? (int)$args[2] : 0;
+            $maxTime = isset($args[3]) ? (int)$args[3] : 0;
+            $success = $cron->processOrders($batchSize, $maxTime);
             break;
-            
+
         case 'stats':
             $stats = $cron->getStats();
             $success = ($stats !== false);
             break;
-            
+
         case 'health':
             $health = $cron->checkShopsHealth();
             $success = ($health !== false);
             break;
-            
+
         default:
             echo "Error: Comando desconocido '{$command}'\n";
             echo "Usa: sync, process, stats o health\n";
             exit(1);
     }
-    
+
     exit($success ? 0 : 1);
 }
 

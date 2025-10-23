@@ -31,9 +31,12 @@ if (!Module::isInstalled('syncrosevi')) {
 // Usar Tools::getValue() método PrestaShop
 $action = Tools::getValue('action', '');
 $security_token = Tools::getValue('security_token', '');
+$batch_size = (int)Tools::getValue('batch_size', 0);
+$max_time = (int)Tools::getValue('max_time', 0);
 
-// Verificar token de seguridad mejorado (fijo por mes en lugar de diario)
-$expected_token = md5('syncrosevi_' . Configuration::get('PS_SHOP_NAME') . '_' . Configuration::get('PS_SHOP_EMAIL') . '_' . date('Y-m'));
+// CORREGIDO: Token de seguridad FIJO (no cambia con el tiempo)
+// Se genera una vez basado en datos de la tienda que no cambian
+$expected_token = md5('syncrosevi_' . Configuration::get('PS_SHOP_NAME') . '_' . Configuration::get('PS_SHOP_EMAIL') . '_FIXED_TOKEN_2024');
 
 if ($security_token !== $expected_token) {
     header('HTTP/1.1 403 Forbidden');
@@ -68,12 +71,14 @@ try {
             break;
             
         case 'process':
-            $results = $module->processOrders();
+            $results = $module->processOrders($batch_size, $max_time);
             echo json_encode(array(
-                'success' => true, 
+                'success' => true,
                 'action' => 'process',
                 'results' => $results,
                 'count' => is_array($results) ? count($results) : 0,
+                'batch_size' => $batch_size > 0 ? $batch_size : 'unlimited',
+                'max_time' => $max_time > 0 ? $max_time : 'unlimited',
                 'timestamp' => date('Y-m-d H:i:s')
             ));
             break;

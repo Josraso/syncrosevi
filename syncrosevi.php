@@ -358,29 +358,60 @@ private function dropTables()
     }
 
     /**
-     * CORREGIDO: Procesar pedidos pendientes - CREAR UN SOLO PEDIDO CONSOLIDADO
+     * CORREGIDO: Procesar pedidos pendientes con soporte para lotes
+     *
+     * @param int $batchSize Número máximo de tiendas a procesar (0 = ilimitado, mantiene compatibilidad)
+     * @param int $maxExecutionTime Tiempo máximo de ejecución en segundos (0 = sin límite)
+     * @return array Resultados del procesamiento
      */
-    public function processOrders()
+    public function processOrders($batchSize = 0, $maxExecutionTime = 0)
     {
+        $startTime = time();
+
         $childShops = Db::getInstance()->executeS(
             'SELECT * FROM `' . _DB_PREFIX_ . 'syncrosevi_child_shops` WHERE `active` = 1'
         );
 
         $processResults = array();
+        $shopsProcessed = 0;
 
-       		
+
 		foreach ($childShops as $shop) {
+            // Control de tiempo de ejecución
+            if ($maxExecutionTime > 0 && (time() - $startTime) >= $maxExecutionTime) {
+                $this->log('Tiempo máximo de ejecución alcanzado (' . $maxExecutionTime . 's). Deteniendo procesamiento.');
+                $processResults[] = array(
+                    'shop' => 'SYSTEM',
+                    'status' => 'info',
+                    'message' => 'Tiempo máximo alcanzado. Procesadas ' . $shopsProcessed . ' tiendas.'
+                );
+                break;
+            }
+
+            // Control de lotes
+            if ($batchSize > 0 && $shopsProcessed >= $batchSize) {
+                $this->log('Límite de lotes alcanzado (' . $batchSize . ' tiendas). Deteniendo procesamiento.');
+                $processResults[] = array(
+                    'shop' => 'SYSTEM',
+                    'status' => 'info',
+                    'message' => 'Límite de lotes alcanzado. Procesadas ' . $batchSize . ' tiendas.'
+                );
+                break;
+            }
+
             try {
                 // Obtener TODAS las líneas pendientes para esta tienda
                 $pendingLines = Db::getInstance()->executeS(
-                    'SELECT * FROM `' . _DB_PREFIX_ . 'syncrosevi_order_lines` 
-                     WHERE id_child_shop = ' . (int)$shop['id_child_shop'] . ' 
+                    'SELECT * FROM `' . _DB_PREFIX_ . 'syncrosevi_order_lines`
+                     WHERE id_child_shop = ' . (int)$shop['id_child_shop'] . '
                      AND processed = 0'
                 );
 
                 if (empty($pendingLines)) {
                     continue;
                 }
+
+                $shopsProcessed++;
 
 // Agrupar productos y sumar cantidades
 $products = array();
@@ -1056,9 +1087,10 @@ if (!empty($shop['id_carrier']) && $shop['id_carrier'] > 0) {
     {
         $action = Tools::getValue('webhook_action');
         $security = Tools::getValue('security_token');
-        
-        // Token de seguridad mejorado (mensual en lugar de diario)
-        $expected_token = md5('syncrosevi_' . Configuration::get('PS_SHOP_NAME') . '_' . Configuration::get('PS_SHOP_EMAIL') . '_' . date('Y-m'));
+
+        // CORREGIDO: Token de seguridad FIJO (no cambia con el tiempo)
+        // Se genera una vez basado en datos de la tienda que no cambian
+        $expected_token = md5('syncrosevi_' . Configuration::get('PS_SHOP_NAME') . '_' . Configuration::get('PS_SHOP_EMAIL') . '_FIXED_TOKEN_2024');
         
         if ($security !== $expected_token) {
             header('HTTP/1.1 403 Forbidden');
@@ -1092,9 +1124,10 @@ if (!empty($shop['id_carrier']) && $shop['id_carrier'] > 0) {
         $shops = $this->getConfiguredShops();
         $stats = $this->getStats();
         $pendingOrders = $this->getPendingOrders();
-        
-        // CORREGIDO: Token mensual
-        $webhook_token = md5('syncrosevi_' . Configuration::get('PS_SHOP_NAME') . '_' . Configuration::get('PS_SHOP_EMAIL') . '_' . date('Y-m'));
+
+        // CORREGIDO: Token de seguridad FIJO (no cambia con el tiempo)
+        // Se genera una vez basado en datos de la tienda que no cambian
+        $webhook_token = md5('syncrosevi_' . Configuration::get('PS_SHOP_NAME') . '_' . Configuration::get('PS_SHOP_EMAIL') . '_FIXED_TOKEN_2024');
         $base_url = (Configuration::get('PS_SSL_ENABLED') ? 'https://' : 'http://') . $_SERVER['HTTP_HOST'] . __PS_BASE_URI__;
         $webhook_sync_url = $base_url . 'modules/syncrosevi/webhook.php?action=sync&security_token=' . $webhook_token;
         $webhook_process_url = $base_url . 'modules/syncrosevi/webhook.php?action=process&security_token=' . $webhook_token;
