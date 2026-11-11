@@ -11,23 +11,23 @@
  * @license   http://opensource.org/licenses/afl-3.0.php  Academic Free License (AFL 3.0)
  */
 
-/**
- * Archivo CORREGIDO para ejecutar las tareas programadas de SyncroSevi
- * 
- * CRONS SEPARADOS:
- * 
- * Para SOLO sincronizar pedidos (cada 15 minutos):
- * */15 * * * * /usr/bin/php /ruta/a/prestashop/modules/syncrosevi/cron/syncrosevi_cron.php sync
- * 
- * Para SOLO procesar pedidos (cada hora):
- * 0 * * * * /usr/bin/php /ruta/a/prestashop/modules/syncrosevi/cron/syncrosevi_cron.php process
- * 
- * Para obtener estadísticas:
- * 0 8 * * * /usr/bin/php /ruta/a/prestashop/modules/syncrosevi/cron/syncrosevi_cron.php stats
- * 
- * Para verificar salud de tiendas:
- * 0 9 * * 1 /usr/bin/php /ruta/a/prestashop/modules/syncrosevi/cron/syncrosevi_cron.php health
- */
+// Tareas programadas de SyncroSevi (ejecutar por línea de comandos, PHP CLI).
+//
+// Sincronizar pedidos (cada 15 minutos):
+//   */15 * * * * php /ruta/a/prestashop/modules/syncrosevi/cron/syncrosevi_cron.php sync
+// Procesar pedidos (cada hora):
+//   0 * * * * php /ruta/a/prestashop/modules/syncrosevi/cron/syncrosevi_cron.php process
+// Estadísticas:
+//   0 8 * * * php /ruta/a/prestashop/modules/syncrosevi/cron/syncrosevi_cron.php stats
+// Comprobar conexión con las tiendas:
+//   0 9 * * 1 php /ruta/a/prestashop/modules/syncrosevi/cron/syncrosevi_cron.php health
+//
+// Si el hosting solo permite cron por URL, usa las URLs del panel de SyncroSevi (webhook sync / process).
+
+if (php_sapi_name() !== 'cli') {
+    header('HTTP/1.1 403 Forbidden');
+    exit('Solo línea de comandos. Para cron por URL usa el webhook del panel de SyncroSevi.');
+}
 
 // Configuración
 ini_set('display_errors', 0);
@@ -42,7 +42,26 @@ if (!$prestashop_root || !file_exists($prestashop_root . '/config/config.inc.php
 
 // Incluir archivos de PrestaShop
 require_once($prestashop_root . '/config/config.inc.php');
-require_once($prestashop_root . '/init.php');
+
+// PrestaShop 1.7.6+ / 8 / 9: crear pedidos necesita el contenedor de Symfony (en CLI no se arranca solo)
+if (empty($GLOBALS['kernel'])) {
+    try {
+        $syncroseviKernelClass = null;
+        if (class_exists('AdminKernel')) {
+            $syncroseviKernelClass = 'AdminKernel';
+        } elseif (file_exists($prestashop_root . '/app/AppKernel.php')) {
+            require_once $prestashop_root . '/app/AppKernel.php';
+            $syncroseviKernelClass = class_exists('AppKernel') ? 'AppKernel' : null;
+        }
+        if ($syncroseviKernelClass) {
+            $kernel = new $syncroseviKernelClass(_PS_MODE_DEV_ ? 'dev' : 'prod', false);
+            $kernel->boot();
+            $GLOBALS['kernel'] = $kernel;
+        }
+    } catch (Exception $e) {
+        // Sin contenedor se intenta igualmente (PrestaShop 1.7 antiguos no lo necesitan)
+    }
+}
 
 // Verificar que el módulo esté instalado
 if (!Module::isInstalled('syncrosevi')) {
@@ -60,7 +79,7 @@ class SyncroSeviCron
     public function __construct()
     {
         $this->module = Module::getInstanceByName('syncrosevi');
-        if (!$this->module) {
+        if (!$this->module || !$this->module->active) {
             die("Error: No se puede cargar el módulo SyncroSevi\n");
         }
         
@@ -110,18 +129,23 @@ class SyncroSeviCron
     }
     
     /**
-     * Ejecutar SOLO procesamiento de pedidos
+     * Ejecutar SOLO procesamiento de pedidos (con límite por lotes)
      */
     public function processOrders()
     {
         $this->log("=== INICIANDO PROCESAMIENTO DE PEDIDOS ===");
-        
+
         try {
-            $results = $this->module->processOrders();
-            
+            // Obtener límite configurado (por defecto 10 si no existe - CONSERVADOR)
+            $batchLimit = (int)Configuration::get('SYNCROSEVI_BATCH_LIMIT') ?: 10;
+            $this->log("Límite de lote configurado: {$batchLimit} pedidos por tienda");
+
+            // Procesar con límite para evitar timeouts
+            $results = $this->module->processOrders($batchLimit);
+
             $totalProcessed = 0;
             $errors = [];
-            
+
             foreach ($results as $result) {
                 if ($result['status'] == 'success') {
                     $totalProcessed++;
@@ -135,10 +159,10 @@ class SyncroSeviCron
                     $this->log("✗ " . $result['shop'] . ": Error - " . $result['message']);
                 }
             }
-            
+
             $this->log("=== PROCESAMIENTO COMPLETADO ===");
             $this->log("Total procesados: {$totalProcessed} pedidos");
-            
+
             if (!empty($errors)) {
                 $this->log("Errores encontrados: " . count($errors));
                 foreach ($errors as $error) {
@@ -146,9 +170,9 @@ class SyncroSeviCron
                 }
                 return false;
             }
-            
+
             return true;
-            
+
         } catch (Exception $e) {
             $this->log("ERROR CRÍTICO en procesamiento: " . $e->getMessage());
             return false;
@@ -266,15 +290,26 @@ class SyncroSeviCron
             mkdir($logDir, 0755, true);
         }
         
+        Syncrosevi::protectDir($logDir);
+
         $dateStr = date('Y-m-d');
         $this->logFile = $logDir . "/syncrosevi_cron_{$dateStr}.log";
+
+        // Se guarda un archivo por día: se borran los de más de 30 días
+        if (!file_exists($this->logFile)) {
+            foreach ((array) glob($logDir . '/syncrosevi_cron_*.log') as $old) {
+                if ($old && filemtime($old) < time() - 30 * 86400) {
+                    @unlink($old);
+                }
+            }
+        }
     }
 }
 
 /**
  * Función principal
  */
-function main($args)
+function syncrosevi_cron_main($args)
 {
     if (empty($args[1])) {
         echo "Uso: php syncrosevi_cron.php [sync|process|stats|health]\n";
@@ -325,5 +360,5 @@ function main($args)
 
 // Ejecutar solo si se llama directamente desde línea de comandos
 if (php_sapi_name() === 'cli') {
-    main($argv);
+    syncrosevi_cron_main($argv);
 }

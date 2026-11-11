@@ -1,0 +1,12 @@
+# SyncroSevi: permite el webhook antiguo (webhook.php) a las tiendas hijas ya configuradas.
+# PrestaShop 9 bloquea en /modules/.htaccess el acceso directo a los .php de los módulos.
+# La URL nueva del webhook es el controlador de módulo y no necesita esta regla.
+<Files "webhook.php">
+    <IfModule mod_authz_core.c>
+        Require all granted
+    </IfModule>
+    <IfModule !mod_authz_core.c>
+        Order allow,deny
+        Allow from all
+    </IfModule>
+</Files>

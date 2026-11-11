@@ -1,0 +1,13 @@
+<?xml version="1.0" encoding="UTF-8" ?>
+<module>
+    <name>syncrosevisender</name>
+    <displayName><![CDATA[SyncroSevi Sender - Webhooks Tiempo Real]]></displayName>
+    <version><![CDATA[2.0.0]]></version>
+    <description><![CDATA[Avisa a la tienda madre (SyncroSevi) cuando un pedido cambia a un estado a sincronizar]]></description>
+    <author><![CDATA[SyncroSevi Team]]></author>
+    <tab><![CDATA[administration]]></tab>
+    <confirmUninstall><![CDATA[¿Estás seguro de que quieres desinstalar este módulo?]]></confirmUninstall>
+    <is_configurable>1</is_configurable>
+    <need_instance>0</need_instance>
+    <limited_countries></limited_countries>
+</module>

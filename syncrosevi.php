@@ -5,12 +5,6 @@
  * NOTICE OF LICENSE
  *
  * This source file is subject to the Academic Free License (AFL 3.0)
- * that is bundled with this package in the file LICENSE.txt.
- * It is also available through the world-wide-web at this URL:
- * http://opensource.org/licenses/afl-3.0.php
- * If you did not receive a copy of the license and are unable to
- * obtain it through the world-wide-web, please send an email
- * to license@prestashop.com so we can send you a copy immediately.
  *
  * @author    SyncroSevi Team
  * @copyright 2024 SyncroSevi
@@ -21,109 +15,404 @@ if (!defined('_PS_VERSION_')) {
     exit;
 }
 
+require_once dirname(__FILE__) . '/classes/SyncroseviUpdater.php';
+
 class Syncrosevi extends Module
 {
-    private $productCache = array(); // NUEVO: Cache para productos
-    private $debug = false; // TEMPORAL: Activar debug
-	
+    /** Código de excepción: el lote no tiene ningún producto que exista en la tienda madre */
+    const ERR_NO_PRODUCTS = 4201;
+
+    /** Tamaño máximo del log antes de rotarlo (5 MB) */
+    const LOG_MAX_SIZE = 5242880;
+
+    private $productCache = array();
+
+    /** Mientras se crea o actualiza un pedido clonado no sale ningún correo a clientes */
+    public static $mailWindow = 0;
+    private static $mailMethodBackup = null;
+    private static $staffEmails = null;
+
+    /** Mientras se crea un clon o se aplica un estado venido de la hija, la madre no avisa a la hija (evita rebotes) */
+    public static $noPush = 0;
+
     public function __construct()
     {
-		
         $this->name = 'syncrosevi';
         $this->tab = 'administration';
-        $this->version = '1.0.2';
+        $this->version = '1.3.0';
         $this->author = 'SyncroSevi Team';
         $this->need_instance = 0;
         $this->ps_versions_compliancy = array(
             'min' => '1.7.0.0',
-            'max' => '8.99.99'
+            'max' => _PS_VERSION_,
         );
         $this->bootstrap = true;
 
         parent::__construct();
 
         $this->displayName = $this->l('SyncroSevi - Sincronización de Pedidos');
-$this->description = $this->l('Módulo para sincronizar pedidos entre tienda madre e hijas mediante WebService');
-$this->confirmUninstall = $this->l('¿Estás seguro de que quieres desinstalar?');
-}
+        $this->description = $this->l('Módulo para sincronizar pedidos entre tienda madre e hijas mediante WebService');
+        $this->confirmUninstall = $this->l('¿Estás seguro de que quieres desinstalar?');
 
-private function log($message) {
-    if ($this->debug) {
-        $logFile = dirname(__FILE__) . '/logs/syncrosevi_debug.log';
-        $logDir = dirname($logFile);
-        if (!is_dir($logDir)) {
-            mkdir($logDir, 0755, true);
+        // Crear configuraciones que falten en instalaciones antiguas (solo si el módulo ya está instalado)
+        if ($this->id) {
+            $this->ensureConfigurationExists();
         }
-        file_put_contents($logFile, '[' . date('Y-m-d H:i:s') . '] ' . $message . PHP_EOL, FILE_APPEND | LOCK_EX);
-        // También enviar a error_log del sistema
-        error_log('SyncroSevi: ' . $message);
     }
-}
 
-public function install()
+    /**
+     * Asegurar que las configuraciones necesarias existen
+     */
+    private function ensureConfigurationExists()
     {
-        if (!parent::install() ||
-            !$this->createTables() ||
-            !$this->installTab() ||
-            !$this->registerHook('actionObjectOrderHistoryAddAfter')) { // CORREGIDO: Hook correcto
+        if (!Configuration::get('SYNCROSEVI_BATCH_LIMIT')) {
+            Configuration::updateValue('SYNCROSEVI_BATCH_LIMIT', 10);
+        }
+        if (!Configuration::get('SYNCROSEVI_WEBHOOK_TOKEN')) {
+            Configuration::updateValue('SYNCROSEVI_WEBHOOK_TOKEN', self::generateToken());
+        }
+    }
+
+    public static function generateToken()
+    {
+        return md5('syncrosevi_' . Configuration::get('PS_SHOP_NAME') . '_' . Configuration::get('PS_SHOP_EMAIL') . '_' . uniqid('', true) . '_' . time());
+    }
+
+    /**
+     * ======================================================================
+     * LOG
+     * ======================================================================
+     */
+
+    /** ¿Está activado el log detallado (consultas SQL, totales, etc.)? */
+    public function isDebug()
+    {
+        return (bool) Configuration::get('SYNCROSEVI_DEBUG');
+    }
+
+    /**
+     * Escribe en logs/syncrosevi_debug.log. Las líneas de detalle ($detail = true) solo se escriben
+     * con el log detallado activado. El archivo se rota al llegar a 5 MB (se guarda una copia .1).
+     */
+    public function log($message, $detail = false)
+    {
+        if ($detail && !$this->isDebug()) {
+            return;
+        }
+        $logDir = dirname(__FILE__) . '/logs';
+        if (!is_dir($logDir)) {
+            @mkdir($logDir, 0755, true);
+            self::protectDir($logDir);
+        }
+        $logFile = $logDir . '/syncrosevi_debug.log';
+        if (@filesize($logFile) > self::LOG_MAX_SIZE) {
+            @rename($logFile, $logFile . '.1');
+        }
+        @file_put_contents($logFile, '[' . date('Y-m-d H:i:s') . '] ' . $message . PHP_EOL, FILE_APPEND | LOCK_EX);
+    }
+
+    /** Bloquea el acceso web a un directorio (logs) */
+    public static function protectDir($dir)
+    {
+        if (!is_dir($dir)) {
+            return;
+        }
+        if (!file_exists($dir . '/.htaccess')) {
+            @file_put_contents($dir . '/.htaccess', "<IfModule mod_authz_core.c>\n    Require all denied\n</IfModule>\n<IfModule !mod_authz_core.c>\n    Order Deny,Allow\n    Deny from all\n</IfModule>\n");
+        }
+        if (!file_exists($dir . '/index.php')) {
+            @file_put_contents($dir . '/index.php', "<?php\nheader('Location: ../');\nexit;\n");
+        }
+    }
+
+    /**
+     * ======================================================================
+     * INSTALACIÓN
+     * ======================================================================
+     */
+
+    public function install()
+    {
+        if (!parent::install()
+            || !$this->createTables()
+            || !$this->installTab()
+            || !$this->registerHook('actionEmailSendBefore')
+            || !$this->registerHook('actionOrderHistoryAddAfter')
+            || !$this->getUpdater()->registerHooks()
+            || !$this->createInitialConfig()
+            || !$this->createFreeShippingCarrier()) {
             return false;
         }
-        
+
         return true;
     }
 
-public function uninstall()
-{
-    if (!parent::uninstall() || !$this->uninstallTab()) {
-        return false;
-    }
-    
-    // Eliminar todas las tablas
-    $this->dropTables();
-    
-    return true;
-}
-private function dropTables()
-{
-    $sql = array();
-    
-    $sql[] = 'DROP TABLE IF EXISTS `' . _DB_PREFIX_ . 'syncrosevi_order_lines`';
-    $sql[] = 'DROP TABLE IF EXISTS `' . _DB_PREFIX_ . 'syncrosevi_order_tracking`';
-    $sql[] = 'DROP TABLE IF EXISTS `' . _DB_PREFIX_ . 'syncrosevi_child_shops`';
-    
-    foreach ($sql as $query) {
-        Db::getInstance()->execute($query);
-    }
-}
-    private function installTab()
+    /**
+     * Activar el módulo. Si la tienda aún no tiene su alta, se pide al servidor en ese momento.
+     */
+    public function enable($force_all = false)
     {
-        $tab = new Tab();
+        $updater = $this->getUpdater();
+        if (!$updater->ready()) {
+            $updater->check(5);
+        }
+        if (!$updater->ready()) {
+            return false;
+        }
+
+        return parent::enable($force_all);
+    }
+
+    public function getUpdater()
+    {
+        return new SyncroseviUpdater($this);
+    }
+
+    /** Aviso periódico al servidor de actualizaciones (solo en el back-office) */
+    public function hookActionAdminControllerSetMedia($params)
+    {
+        $this->getUpdater()->maybePing();
+    }
+
+    /** PS 8.1+: la versión nueva aparece en Gestor de módulos > Actualizaciones */
+    public function hookActionListModules($params)
+    {
+        return $this->getUpdater()->getNativeModuleList();
+    }
+
+    /** Aviso para el back-office cuando la tienda no está habilitada */
+    public function notEnabledMessage()
+    {
+        return sprintf(
+            $this->l('SyncroSevi no está habilitado para esta tienda (%s): no sincronizará ni procesará pedidos. Escribe a Josra indicando este dominio para darlo de alta.'),
+            Tools::getShopDomainSsl(false) . __PS_BASE_URI__
+        );
+    }
+
+    public function uninstall()
+    {
+        $this->getUpdater()->notifyUninstall();
+        if (!parent::uninstall()) {
+            return false;
+        }
+        foreach (array('_UPD_TS', '_UPD_INFO', '_UPD_SU', '_UPD_LT') as $suffix) {
+            Configuration::deleteByName('SYNCROSEVI' . $suffix);
+        }
+        $this->uninstallTab();
+        $this->deleteFreeShippingCarrier();
+        $this->dropTables();
+        $this->removeConfig();
+
+        return true;
+    }
+
+    /**
+     * Crear transportista gratuito de SyncroSevi
+     */
+    private function createFreeShippingCarrier()
+    {
+        try {
+            // Si ya existe (reinstalación), reutilizarlo
+            $existing = (int) Configuration::get('SYNCROSEVI_FREE_CARRIER_ID');
+            if ($existing) {
+                $carrier = new Carrier($existing);
+                if (Validate::isLoadedObject($carrier) && !$carrier->deleted) {
+                    return true;
+                }
+            }
+
+            $carrier = new Carrier();
+            $carrier->name = 'SyncroSevi - Envío Gratuito';
+            $carrier->active = 1;
+            $carrier->is_free = 1;
+            $carrier->shipping_handling = 0;
+            $carrier->range_behavior = 0;
+            $carrier->shipping_method = Carrier::SHIPPING_METHOD_WEIGHT;
+            $carrier->max_width = 0;
+            $carrier->max_height = 0;
+            $carrier->max_depth = 0;
+            $carrier->max_weight = 0;
+            $carrier->grade = 1;
+
+            $delay = array();
+            foreach (Language::getLanguages(false) as $language) {
+                $delay[$language['id_lang']] = 'Envío gratuito para pedidos consolidados';
+            }
+            $carrier->delay = $delay;
+
+            if ($carrier->add()) {
+                Configuration::updateValue('SYNCROSEVI_FREE_CARRIER_ID', $carrier->id);
+
+                if ($this->setupCarrierRanges($carrier)) {
+                    $this->log('✓ Transportista gratuito SyncroSevi creado correctamente (ID: ' . $carrier->id . ')');
+
+                    return true;
+                }
+                $carrier->delete();
+            }
+
+            return false;
+        } catch (Exception $e) {
+            $this->log('✗ Error creando transportista gratuito: ' . $e->getMessage());
+
+            return false;
+        }
+    }
+
+    private function setupCarrierRanges($carrier)
+    {
+        try {
+            $range_weight = new RangeWeight();
+            $range_weight->id_carrier = $carrier->id;
+            $range_weight->delimiter1 = 0;
+            $range_weight->delimiter2 = 999999;
+            if (!$range_weight->add()) {
+                $this->log('✗ Error creando rango de peso');
+
+                return false;
+            }
+
+            $range_price = new RangePrice();
+            $range_price->id_carrier = $carrier->id;
+            $range_price->delimiter1 = 0;
+            $range_price->delimiter2 = 999999;
+            if (!$range_price->add()) {
+                $this->log('✗ Error creando rango de precio');
+
+                return false;
+            }
+
+            foreach (Zone::getZones() as $zone) {
+                $carrier->addZone($zone['id_zone']);
+                Db::getInstance()->insert('delivery', array(
+                    'id_carrier' => (int) $carrier->id,
+                    'id_range_weight' => (int) $range_weight->id,
+                    'id_zone' => (int) $zone['id_zone'],
+                    'price' => 0,
+                ));
+                Db::getInstance()->insert('delivery', array(
+                    'id_carrier' => (int) $carrier->id,
+                    'id_range_price' => (int) $range_price->id,
+                    'id_zone' => (int) $zone['id_zone'],
+                    'price' => 0,
+                ));
+            }
+
+            foreach (Group::getGroups(Configuration::get('PS_LANG_DEFAULT')) as $group) {
+                Db::getInstance()->insert('carrier_group', array(
+                    'id_carrier' => (int) $carrier->id,
+                    'id_group' => (int) $group['id_group'],
+                ), false, true, Db::INSERT_IGNORE);
+            }
+
+            return true;
+        } catch (Exception $e) {
+            $this->log('✗ Error configurando rangos del transportista: ' . $e->getMessage());
+
+            return false;
+        }
+    }
+
+    /**
+     * Eliminar transportista gratuito al desinstalar
+     */
+    private function deleteFreeShippingCarrier()
+    {
+        try {
+            $carrierId = (int) Configuration::get('SYNCROSEVI_FREE_CARRIER_ID');
+            if ($carrierId) {
+                $carrier = new Carrier($carrierId);
+                if (Validate::isLoadedObject($carrier)) {
+                    Db::getInstance()->delete('delivery', 'id_carrier = ' . $carrierId);
+                    Db::getInstance()->delete('carrier_zone', 'id_carrier = ' . $carrierId);
+                    Db::getInstance()->delete('carrier_group', 'id_carrier = ' . $carrierId);
+                    Db::getInstance()->delete('range_weight', 'id_carrier = ' . $carrierId);
+                    Db::getInstance()->delete('range_price', 'id_carrier = ' . $carrierId);
+                    $carrier->delete();
+                }
+                Configuration::deleteByName('SYNCROSEVI_FREE_CARRIER_ID');
+            }
+        } catch (Exception $e) {
+            $this->log('✗ Error eliminando transportista gratuito: ' . $e->getMessage());
+        }
+
+        return true;
+    }
+
+    private function createInitialConfig()
+    {
+        if (!Configuration::get('SYNCROSEVI_WEBHOOK_TOKEN')) {
+            Configuration::updateValue('SYNCROSEVI_WEBHOOK_TOKEN', self::generateToken());
+        }
+        // Límite de pedidos por tienda en cada procesamiento (evita timeouts)
+        if (!Configuration::get('SYNCROSEVI_BATCH_LIMIT')) {
+            Configuration::updateValue('SYNCROSEVI_BATCH_LIMIT', 10);
+        }
+        Configuration::updateValue('SYNCROSEVI_DEBUG', 0);
+
+        $logDir = dirname(__FILE__) . '/logs';
+        if (!is_dir($logDir)) {
+            @mkdir($logDir, 0755, true);
+        }
+        self::protectDir($logDir);
+
+        return true;
+    }
+
+    private function removeConfig()
+    {
+        Configuration::deleteByName('SYNCROSEVI_WEBHOOK_TOKEN');
+        Configuration::deleteByName('SYNCROSEVI_FREE_CARRIER_ID');
+        Configuration::deleteByName('SYNCROSEVI_BATCH_LIMIT');
+        Configuration::deleteByName('SYNCROSEVI_DEBUG');
+        Configuration::deleteByName('SYNCROSEVI_CLONE_ACTIVE');
+
+        return true;
+    }
+
+    private function dropTables()
+    {
+        Db::getInstance()->execute('DROP TABLE IF EXISTS `' . _DB_PREFIX_ . 'syncrosevi_order_lines`');
+        Db::getInstance()->execute('DROP TABLE IF EXISTS `' . _DB_PREFIX_ . 'syncrosevi_order_tracking`');
+        Db::getInstance()->execute('DROP TABLE IF EXISTS `' . _DB_PREFIX_ . 'syncrosevi_child_shops`');
+        Db::getInstance()->execute('DROP TABLE IF EXISTS `' . _DB_PREFIX_ . 'syncrosevi_clone_customer`');
+    }
+
+    /**
+     * Pestaña oculta (no aparece en el menú lateral): se entra desde Módulos > Configurar
+     */
+    public function installTab()
+    {
+        $id_tab = (int) Tab::getIdFromClassName('AdminSyncrosevi');
+        $tab = $id_tab ? new Tab($id_tab) : new Tab();
         $tab->active = 1;
         $tab->class_name = 'AdminSyncrosevi';
         $tab->name = array();
-        foreach (Language::getLanguages(true) as $lang) {
+        foreach (Language::getLanguages(false) as $lang) {
             $tab->name[$lang['id_lang']] = 'SyncroSevi';
         }
-        $tab->id_parent = (int)Tab::getIdFromClassName('AdminParentOrders');
+        $tab->id_parent = -1;
         $tab->module = $this->name;
-        return $tab->add();
+
+        return $id_tab ? $tab->save() : $tab->add();
     }
 
     private function uninstallTab()
     {
-        $id_tab = (int)Tab::getIdFromClassName('AdminSyncrosevi');
+        $id_tab = (int) Tab::getIdFromClassName('AdminSyncrosevi');
         if ($id_tab) {
             $tab = new Tab($id_tab);
+
             return $tab->delete();
         }
-        return false;
+
+        return true;
     }
 
     private function createTables()
     {
         $sql = array();
 
-        // Tabla de configuración de tiendas hijas
         $sql[] = 'CREATE TABLE IF NOT EXISTS `' . _DB_PREFIX_ . 'syncrosevi_child_shops` (
             `id_child_shop` int(11) NOT NULL AUTO_INCREMENT,
             `name` varchar(255) NOT NULL,
@@ -137,27 +426,33 @@ private function dropTables()
             `start_order_id` int(11) NOT NULL DEFAULT 1,
             `import_states` varchar(255) NOT NULL DEFAULT "2,3,4,5",
             `active` tinyint(1) NOT NULL DEFAULT 1,
+            `realtime_enabled` tinyint(1) NOT NULL DEFAULT 1,
+            `webhook_secret` varchar(64) NOT NULL DEFAULT "",
+            `last_webhook` datetime NULL DEFAULT NULL,
             `date_add` datetime NOT NULL,
             `date_upd` datetime NOT NULL,
             PRIMARY KEY (`id_child_shop`),
-            KEY `idx_active` (`active`)
+            KEY `idx_active` (`active`),
+            KEY `idx_realtime` (`realtime_enabled`)
         ) ENGINE=' . _MYSQL_ENGINE_ . ' DEFAULT CHARSET=utf8;';
 
-        // Tabla de tracking de pedidos
         $sql[] = 'CREATE TABLE IF NOT EXISTS `' . _DB_PREFIX_ . 'syncrosevi_order_tracking` (
             `id_tracking` int(11) NOT NULL AUTO_INCREMENT,
             `id_original_order` int(11) NOT NULL,
             `id_child_shop` int(11) NOT NULL,
             `id_mother_order` int(11) NULL DEFAULT NULL,
             `processed` tinyint(1) NOT NULL DEFAULT 0,
+            `realtime_sync` tinyint(1) NOT NULL DEFAULT 0,
             `date_sync` datetime NOT NULL,
+            `date_realtime` datetime NULL DEFAULT NULL,
             `date_processed` datetime NULL DEFAULT NULL,
             PRIMARY KEY (`id_tracking`),
             UNIQUE KEY `unique_order_shop` (`id_original_order`, `id_child_shop`),
-            KEY `idx_processed` (`processed`)
+            KEY `idx_shop_order` (`id_child_shop`, `id_original_order`),
+            KEY `idx_processed` (`processed`),
+            KEY `idx_realtime` (`realtime_sync`)
         ) ENGINE=' . _MYSQL_ENGINE_ . ' DEFAULT CHARSET=utf8;';
 
-        // Tabla temporal de líneas de pedido
         $sql[] = 'CREATE TABLE IF NOT EXISTS `' . _DB_PREFIX_ . 'syncrosevi_order_lines` (
             `id_line` int(11) NOT NULL AUTO_INCREMENT,
             `id_child_shop` int(11) NOT NULL,
@@ -180,291 +475,383 @@ private function dropTables()
             }
         }
 
-        // Actualizar tabla existente si no tiene las nuevas columnas
         $this->updateExistingTables();
-        
+
         return true;
     }
-    
-    private function updateExistingTables()
+
+    /**
+     * Añade columnas e índices que falten en instalaciones antiguas (se puede llamar varias veces)
+     */
+    public function updateExistingTables()
     {
-        $columns = Db::getInstance()->executeS("SHOW COLUMNS FROM `" . _DB_PREFIX_ . "syncrosevi_child_shops`");
-        $hasStartOrderId = false;
-        $hasImportStates = false;
-        
-        foreach ($columns as $column) {
-            if ($column['Field'] == 'start_order_id') $hasStartOrderId = true;
-            if ($column['Field'] == 'import_states') $hasImportStates = true;
+        $db = Db::getInstance();
+        $columns = array_column((array) $db->executeS('SHOW COLUMNS FROM `' . _DB_PREFIX_ . 'syncrosevi_child_shops`'), 'Field');
+
+        if (!in_array('start_order_id', $columns)) {
+            $db->execute('ALTER TABLE `' . _DB_PREFIX_ . 'syncrosevi_child_shops` ADD COLUMN `start_order_id` int(11) NOT NULL DEFAULT 1 AFTER `id_order_state`');
         }
-        
-        if (!$hasStartOrderId) {
-            Db::getInstance()->execute('ALTER TABLE `' . _DB_PREFIX_ . 'syncrosevi_child_shops` ADD COLUMN `start_order_id` int(11) NOT NULL DEFAULT 1 AFTER `id_order_state`');
+        if (!in_array('import_states', $columns)) {
+            $db->execute('ALTER TABLE `' . _DB_PREFIX_ . 'syncrosevi_child_shops` ADD COLUMN `import_states` varchar(255) NOT NULL DEFAULT "2,3,4,5" AFTER `start_order_id`');
         }
-        
-        if (!$hasImportStates) {
-            Db::getInstance()->execute('ALTER TABLE `' . _DB_PREFIX_ . 'syncrosevi_child_shops` ADD COLUMN `import_states` varchar(255) NOT NULL DEFAULT "2,3,4,5" AFTER `start_order_id`');
+        if (!in_array('realtime_enabled', $columns)) {
+            $db->execute('ALTER TABLE `' . _DB_PREFIX_ . 'syncrosevi_child_shops` ADD COLUMN `realtime_enabled` tinyint(1) NOT NULL DEFAULT 1 AFTER `active`');
         }
+        if (!in_array('webhook_secret', $columns)) {
+            $db->execute('ALTER TABLE `' . _DB_PREFIX_ . 'syncrosevi_child_shops` ADD COLUMN `webhook_secret` varchar(64) NOT NULL DEFAULT "" AFTER `realtime_enabled`');
+        }
+        if (!in_array('last_webhook', $columns)) {
+            $db->execute('ALTER TABLE `' . _DB_PREFIX_ . 'syncrosevi_child_shops` ADD COLUMN `last_webhook` datetime NULL DEFAULT NULL AFTER `webhook_secret`');
+        }
+
+        // Claves secretas para tiendas que no la tengan
+        $shops = $db->executeS('SELECT id_child_shop FROM `' . _DB_PREFIX_ . 'syncrosevi_child_shops` WHERE webhook_secret = "" OR webhook_secret IS NULL');
+        foreach ((array) $shops as $shop) {
+            $db->update('syncrosevi_child_shops', array('webhook_secret' => bin2hex(random_bytes(32))), 'id_child_shop = ' . (int) $shop['id_child_shop']);
+        }
+
+        $trackingColumns = array_column((array) $db->executeS('SHOW COLUMNS FROM `' . _DB_PREFIX_ . 'syncrosevi_order_tracking`'), 'Field');
+        if (!in_array('realtime_sync', $trackingColumns)) {
+            $db->execute('ALTER TABLE `' . _DB_PREFIX_ . 'syncrosevi_order_tracking` ADD COLUMN `realtime_sync` tinyint(1) NOT NULL DEFAULT 0 AFTER `processed`');
+        }
+        if (!in_array('date_realtime', $trackingColumns)) {
+            $db->execute('ALTER TABLE `' . _DB_PREFIX_ . 'syncrosevi_order_tracking` ADD COLUMN `date_realtime` datetime NULL DEFAULT NULL AFTER `date_sync`');
+        }
+
+        // Modo clonar (1.2.0)
+        $shopColumns = array(
+            'sync_mode' => 'varchar(16) NOT NULL DEFAULT "consolidated"',
+            'clone_missing' => 'varchar(16) NOT NULL DEFAULT "hold"',
+            'id_product_substitute' => 'int(11) NOT NULL DEFAULT 0',
+            'clone_date' => 'varchar(16) NOT NULL DEFAULT "import"',
+            'clone_state_sync' => 'tinyint(1) NOT NULL DEFAULT 0',
+            'clone_state_map' => 'text NULL',
+            'clone_state_map_out' => 'text NULL',
+            'clone_state_email' => 'tinyint(1) NOT NULL DEFAULT 0',
+            'clone_tax_map' => 'text NULL',
+        );
+        foreach ($shopColumns as $name => $definition) {
+            if (!in_array($name, $columns)) {
+                $db->execute('ALTER TABLE `' . _DB_PREFIX_ . 'syncrosevi_child_shops` ADD COLUMN `' . $name . '` ' . $definition);
+            }
+        }
+        $trackingNew = array(
+            'is_clone' => 'tinyint(1) NOT NULL DEFAULT 0',
+            'child_state' => 'int(11) NOT NULL DEFAULT 0',
+            'clone_error' => 'text NULL',
+        );
+        foreach ($trackingNew as $name => $definition) {
+            if (!in_array($name, $trackingColumns)) {
+                $db->execute('ALTER TABLE `' . _DB_PREFIX_ . 'syncrosevi_order_tracking` ADD COLUMN `' . $name . '` ' . $definition);
+            }
+        }
+        $db->execute('CREATE TABLE IF NOT EXISTS `' . _DB_PREFIX_ . 'syncrosevi_clone_customer` (
+            `id_customer` int(11) NOT NULL,
+            `id_child_shop` int(11) NOT NULL DEFAULT 0,
+            `date_add` datetime NOT NULL,
+            PRIMARY KEY (`id_customer`)
+        ) ENGINE=' . _MYSQL_ENGINE_ . ' DEFAULT CHARSET=utf8;');
+
+        // Índice para obtener rápido los pedidos ya sincronizados de cada tienda
+        $indexes = array_column((array) $db->executeS('SHOW INDEX FROM `' . _DB_PREFIX_ . 'syncrosevi_order_tracking`'), 'Key_name');
+        if (!in_array('idx_shop_order', $indexes)) {
+            $db->execute('ALTER TABLE `' . _DB_PREFIX_ . 'syncrosevi_order_tracking` ADD INDEX `idx_shop_order` (`id_child_shop`, `id_original_order`)');
+        }
+
+        return true;
     }
 
     /**
-     * CORREGIDO: Hook correcto para cambios de estado de pedido
+     * ======================================================================
+     * UTILIDADES
+     * ======================================================================
      */
-    public function hookActionObjectOrderHistoryAddAfter($params)
-    {
-        try {
-            if (!isset($params['object']) || !($params['object'] instanceof OrderHistory)) {
-                return;
-            }
-            
-            $orderHistory = $params['object'];
-            $orderId = $orderHistory->id_order;
-            $newStateId = $orderHistory->id_order_state;
-            
-            // Obtener tiendas hijas activas
-            $childShops = Db::getInstance()->executeS(
-                'SELECT * FROM `' . _DB_PREFIX_ . 'syncrosevi_child_shops` WHERE `active` = 1'
-            );
-            
-            if (empty($childShops)) {
-                return;
-            }
-            
-            // Sincronizar este pedido específico si cumple condiciones
-            $this->syncSingleOrderToTemp($orderId, $newStateId, $childShops);
-            
-        } catch (Exception $e) {
-            $this->log('Hook Error: ' . $e->getMessage());
-        }
-    }
-	
-	/**
-     * Sincronizar un pedido específico a tabla temporal
-     */
-    private function syncSingleOrderToTemp($orderId, $stateId, $childShops)
+
+    private function loadWebservice()
     {
         if (!class_exists('SyncroSeviWebservice')) {
-            require_once(dirname(__FILE__).'/classes/SyncroSeviWebservice.php');
-        }
-
-        foreach ($childShops as $shop) {
-            $importStates = explode(',', $shop['import_states']);
-            if (!in_array($stateId, $importStates)) {
-                continue;
-            }
-            
-            try {
-                $webservice = new SyncroSeviWebservice($shop['url'], $shop['api_key'], false);
-                $orders = $webservice->getNewOrders($orderId, $shop['import_states']);
-                
-                foreach ($orders as $order) {
-                    if ($order['id'] == $orderId) {
-                        $this->syncOrderToTemp($order, $shop);
-                        break;
-                    }
-                }
-                
-            } catch (Exception $e) {
-                $this->log('Error sincronizando pedido #' . $orderId . ' de ' . $shop['name'] . ': ' . $e->getMessage());
-            }
+            require_once dirname(__FILE__) . '/classes/SyncroSeviWebservice.php';
         }
     }
 
+    /** Tiendas hijas activas (o solo una si se indica) */
+    private function getActiveShops($onlyShopId = null)
+    {
+        return (array) Db::getInstance()->executeS(
+            'SELECT * FROM `' . _DB_PREFIX_ . 'syncrosevi_child_shops` WHERE `active` = 1'
+            . ($onlyShopId ? ' AND id_child_shop = ' . (int) $onlyShopId : '')
+            . ' ORDER BY id_child_shop ASC'
+        );
+    }
+
+    /** Estados a importar de una tienda como array de enteros */
+    public static function parseStates($states)
+    {
+        return array_values(array_filter(array_map('intval', explode(',', (string) $states))));
+    }
+
     /**
-     * Sincronizar un pedido a tabla temporal
+     * URL del webhook de esta tienda (controlador de módulo, funciona también en PrestaShop 9 con Apache)
+     */
+    public function getWebhookUrl($action = 'realtime_sync')
+    {
+        $params = array('security_token' => Configuration::get('SYNCROSEVI_WEBHOOK_TOKEN'));
+        if ($action) {
+            $params = array('action' => $action) + $params;
+        }
+
+        return Context::getContext()->link->getModuleLink($this->name, 'webhook', $params);
+    }
+
+    /**
+     * ======================================================================
+     * SINCRONIZACIÓN (descarga pedidos de las tiendas hijas a la tabla temporal)
+     * ======================================================================
+     */
+
+    /**
+     * Guardar un pedido de la tienda hija en la tabla temporal
+     *
+     * @return bool true si se ha insertado (false si ya estaba)
      */
     private function syncOrderToTemp($order, $shop)
     {
-        // Verificar si ya está sincronizado
-        $existing = Db::getInstance()->getRow(
-            'SELECT id_tracking FROM `' . _DB_PREFIX_ . 'syncrosevi_order_tracking` 
-             WHERE id_original_order = ' . (int)$order['id'] . ' 
-             AND id_child_shop = ' . (int)$shop['id_child_shop']
-        );
+        if (empty($order['order_rows'])) {
+            return false;
+        }
 
+        $db = Db::getInstance();
+        $existing = $db->getValue(
+            'SELECT id_tracking FROM `' . _DB_PREFIX_ . 'syncrosevi_order_tracking`
+             WHERE id_original_order = ' . (int) $order['id'] . '
+             AND id_child_shop = ' . (int) $shop['id_child_shop']
+        );
         if ($existing) {
             return false;
         }
 
-        // Insertar tracking
-        Db::getInstance()->insert('syncrosevi_order_tracking', array(
-            'id_original_order' => (int)$order['id'],
-            'id_child_shop' => (int)$shop['id_child_shop'],
+        $now = date('Y-m-d H:i:s');
+        // INSERT IGNORE: si dos procesos (cron + webhook) llegan a la vez, solo uno inserta las líneas
+        $db->insert('syncrosevi_order_tracking', array(
+            'id_original_order' => (int) $order['id'],
+            'id_child_shop' => (int) $shop['id_child_shop'],
             'processed' => 0,
-            'date_sync' => date('Y-m-d H:i:s')
-        ));
-
-        // Insertar líneas de pedido
-        foreach ($order['order_rows'] as $line) {
-            Db::getInstance()->insert('syncrosevi_order_lines', array(
-                'id_child_shop' => (int)$shop['id_child_shop'],
-                'id_original_order' => (int)$order['id'],
-                'id_product' => (int)$line['product_id'],
-                'id_product_attribute' => (int)$line['product_attribute_id'],
-                'quantity' => (int)$line['product_quantity'],
-                'product_reference' => pSQL($line['product_reference']),
-                'product_name' => pSQL($line['product_name']),
-                'processed' => 0,
-                'date_add' => date('Y-m-d H:i:s')
-            ));
+            'date_sync' => $now,
+        ), false, true, Db::INSERT_IGNORE);
+        if (!$db->Affected_Rows()) {
+            return false;
         }
+
+        $rows = array();
+        foreach ($order['order_rows'] as $line) {
+            $rows[] = array(
+                'id_child_shop' => (int) $shop['id_child_shop'],
+                'id_original_order' => (int) $order['id'],
+                'id_product' => (int) $line['product_id'],
+                'id_product_attribute' => (int) $line['product_attribute_id'],
+                'quantity' => (int) $line['product_quantity'],
+                'product_reference' => pSQL($line['product_reference']),
+                'product_name' => pSQL(Tools::substr($line['product_name'], 0, 255)),
+                'processed' => 0,
+                'date_add' => $now,
+            );
+        }
+        $db->insert('syncrosevi_order_lines', $rows);
 
         return true;
     }
 
     /**
-     * Método para ejecutar sincronización manual
+     * Sincronizar pedidos desde las tiendas hijas activas
+     *
+     * @param int|null $onlyShopId para sincronizar solo una tienda
      */
-    public function syncOrders()
+    public function syncOrders($onlyShopId = null)
     {
-        if (!class_exists('SyncroSeviWebservice')) {
-            require_once(dirname(__FILE__).'/classes/SyncroSeviWebservice.php');
+        if (!$this->getUpdater()->ready()) {
+            return array();
         }
-
-        $childShops = Db::getInstance()->executeS(
-            'SELECT * FROM `' . _DB_PREFIX_ . 'syncrosevi_child_shops` WHERE `active` = 1'
-        );
-
+        $this->loadWebservice();
         $syncResults = array();
-        
-        foreach ($childShops as $shop) {
+
+        foreach ($this->getActiveShops($onlyShopId) as $shop) {
             try {
-                $webservice = new SyncroSeviWebservice($shop['url'], $shop['api_key'], true);
-                $orders = $webservice->getNewOrders($shop['start_order_id'], $shop['import_states']);
-                
+                $webservice = new SyncroSeviWebservice($shop['url'], $shop['api_key'], $this->isDebug());
+
+                // Pedidos que ya tenemos: no se vuelven a descargar
+                $known = Db::getInstance()->executeS(
+                    'SELECT id_original_order FROM `' . _DB_PREFIX_ . 'syncrosevi_order_tracking`
+                     WHERE id_child_shop = ' . (int) $shop['id_child_shop'] . '
+                     AND id_original_order >= ' . (int) $shop['start_order_id']
+                );
+                $knownIds = array_column((array) $known, 'id_original_order');
+
+                $orders = $webservice->getNewOrders($shop['start_order_id'], $shop['import_states'], $knownIds);
+
                 $syncCount = 0;
                 foreach ($orders as $order) {
                     if ($this->syncOrderToTemp($order, $shop)) {
-                        $syncCount++;
+                        ++$syncCount;
                     }
                 }
-                
+
+                if ($syncCount) {
+                    $this->log('Sincronización ' . $shop['name'] . ': ' . $syncCount . ' pedidos nuevos');
+                }
+
+                // Modo clonar: los cambios de estado de la hija pasan a los pedidos clonados
+                if (self::isCloneShop($shop) && self::syncIn($shop)) {
+                    try {
+                        $this->syncCloneStates($shop, $webservice);
+                    } catch (Exception $e) {
+                        $this->log('✗ Estados de los clones de ' . $shop['name'] . ': ' . $e->getMessage());
+                    }
+                }
+
                 $syncResults[] = array(
                     'shop' => $shop['name'],
                     'count' => $syncCount,
-                    'status' => 'success'
+                    'status' => 'success',
+                    'more' => $webservice->hasMore,
                 );
-                
             } catch (Exception $e) {
+                $this->log('✗ Error sincronizando ' . $shop['name'] . ': ' . $e->getMessage());
                 $syncResults[] = array(
                     'shop' => $shop['name'],
                     'count' => 0,
                     'status' => 'error',
-                    'message' => $e->getMessage()
+                    'message' => $e->getMessage(),
                 );
             }
         }
-        
+
         return $syncResults;
     }
 
     /**
-     * CORREGIDO: Procesar pedidos pendientes - CREAR UN SOLO PEDIDO CONSOLIDADO
+     * ======================================================================
+     * PROCESAMIENTO (crea un pedido consolidado por tienda en la tienda madre)
+     * ======================================================================
      */
-    public function processOrders()
+
+    /**
+     * Procesar pedidos pendientes - CREA UN SOLO PEDIDO CONSOLIDADO POR TIENDA
+     *
+     * Solo se marcan como procesados los pedidos del lote cuando el pedido madre se crea bien
+     * (o cuando ninguno de sus productos existe en la tienda madre). Si falla, quedan pendientes
+     * para el siguiente intento y el error se devuelve en el resultado.
+     *
+     * @param int $limit número máximo de pedidos por tienda (null = configuración)
+     * @param int|null $onlyShopId para procesar solo una tienda
+     */
+    public function processOrders($limit = null, $onlyShopId = null)
     {
-        $childShops = Db::getInstance()->executeS(
-            'SELECT * FROM `' . _DB_PREFIX_ . 'syncrosevi_child_shops` WHERE `active` = 1'
-        );
+        if (!$this->getUpdater()->ready()) {
+            return array();
+        }
+        if ($limit === null) {
+            $limit = (int) Configuration::get('SYNCROSEVI_BATCH_LIMIT') ?: 10;
+        }
+        if ($limit <= 0 || $limit > 50) {
+            $limit = 10;
+        }
 
+        $db = Db::getInstance();
         $processResults = array();
+        $this->ensureContext();
 
-       		
-		foreach ($childShops as $shop) {
+        foreach ($this->getActiveShops($onlyShopId) as $shop) {
+            if (self::isCloneShop($shop)) {
+                $processResults = array_merge($processResults, $this->processCloneOrders($shop, $limit));
+                continue;
+            }
+            $idShop = (int) $shop['id_child_shop'];
             try {
-                // Obtener TODAS las líneas pendientes para esta tienda
-                $pendingLines = Db::getInstance()->executeS(
-                    'SELECT * FROM `' . _DB_PREFIX_ . 'syncrosevi_order_lines` 
-                     WHERE id_child_shop = ' . (int)$shop['id_child_shop'] . ' 
-                     AND processed = 0'
+                $limitedOrderIds = $db->executeS(
+                    'SELECT DISTINCT id_original_order FROM `' . _DB_PREFIX_ . 'syncrosevi_order_lines`
+                     WHERE id_child_shop = ' . $idShop . ' AND processed = 0
+                     ORDER BY id_original_order ASC
+                     LIMIT ' . (int) $limit
                 );
+                if (empty($limitedOrderIds)) {
+                    continue;
+                }
 
+                $orderIds = array_map('intval', array_column($limitedOrderIds, 'id_original_order'));
+                $inIds = implode(',', $orderIds);
+
+                $pendingLines = $db->executeS(
+                    'SELECT * FROM `' . _DB_PREFIX_ . 'syncrosevi_order_lines`
+                     WHERE id_child_shop = ' . $idShop . ' AND processed = 0
+                     AND id_original_order IN (' . $inIds . ')'
+                );
                 if (empty($pendingLines)) {
                     continue;
                 }
 
-// Agrupar productos y sumar cantidades
-$products = array();
-foreach ($pendingLines as $line) {
-    $key = $line['id_product'] . '_' . $line['id_product_attribute'];
-    if (isset($products[$key])) {
-        $products[$key]['quantity'] += $line['quantity'];
-    } else {
-        $products[$key] = $line;
-    }
-}
+                $this->log('Procesando lote de ' . count($orderIds) . ' pedidos de ' . $shop['name'] . ' (#' . implode(', #', $orderIds) . ')');
 
-// DEBUG: Log productos agrupados
-$this->log(' DEBUG - Tienda ' . $shop['name'] . ': ' . count($products) . ' productos únicos agrupados');
-foreach ($products as $prod) {
-    $this->log(' DEBUG - Producto: ' . $prod['product_reference'] . ' (ID: ' . $prod['id_product'] . ') Cantidad: ' . $prod['quantity']);
-}
-
-                try {
-                    Db::getInstance()->execute('START TRANSACTION');
-                    
-                    $orderId = null;
-                    $validProducts = 0;
-                    
-                    try {
-                        $customer = $this->validateCustomer($shop['id_customer']);
-                        $address = $this->validateAddress($shop['id_address'], $customer->id);
-                        $cart = $this->createTempCart($customer, $address, $shop);
-                        $orderData = $this->calculateOrderData($products, $shop, $cart, $address);
-                        $validProducts = count($orderData['products_details']);
-                        
-                        if ($validProducts > 0) {
-                            $orderId = $this->createMotherOrder($products, $shop, $customer, $address, $cart);
-                        }
-                    } catch (Exception $e) {
-                        $this->log(': Error calculando productos: ' . $e->getMessage());
-                    }
-                    
-                    // SIEMPRE marcar como procesado
-                    Db::getInstance()->execute(
-                        'UPDATE `' . _DB_PREFIX_ . 'syncrosevi_order_lines` 
-                         SET processed = 1 
-                         WHERE id_child_shop = ' . (int)$shop['id_child_shop'] . ' 
-                         AND processed = 0'
-                    );
-
-                    Db::getInstance()->execute(
-                        'UPDATE `' . _DB_PREFIX_ . 'syncrosevi_order_tracking` 
-                         SET id_mother_order = ' . ($orderId ? (int)$orderId : 0) . ', 
-                             processed = 1, 
-                             date_processed = "' . date('Y-m-d H:i:s') . '" 
-                         WHERE id_child_shop = ' . (int)$shop['id_child_shop'] . ' 
-                         AND processed = 0'
-                    );
-                    
-                    Db::getInstance()->execute('COMMIT');
-                    
-                    if ($orderId) {
-                        $processResults[] = array(
-                            'shop' => $shop['name'],
-                            'order_id' => $orderId,
-                            'products_count' => $validProducts,
-                            'status' => 'success'
-                        );
+                // Agrupar productos y sumar cantidades
+                $products = array();
+                foreach ($pendingLines as $line) {
+                    $key = $line['id_product'] . '_' . $line['id_product_attribute'] . '_' . $line['product_reference'];
+                    if (isset($products[$key])) {
+                        $products[$key]['quantity'] += (int) $line['quantity'];
                     } else {
-                        $processResults[] = array(
-                            'shop' => $shop['name'],
-                            'status' => 'success',
-                            'message' => 'Procesado sin crear pedido (sin productos válidos)'
-                        );
+                        $products[$key] = $line;
                     }
+                }
+
+                $orderId = null;
+                $validProducts = 0;
+                $noProducts = false;
+
+                $db->execute('START TRANSACTION');
+                try {
+                    $customer = $this->validateCustomer($shop['id_customer']);
+                    $address = $this->validateAddress($shop['id_address'], $customer->id);
+                    $created = $this->createMotherOrder($products, $shop, $customer, $address);
+                    $orderId = $created['id_order'];
+                    $validProducts = $created['products'];
+                    $this->markBatchProcessed($idShop, $inIds, $orderId);
+                    $db->execute('COMMIT');
                 } catch (Exception $e) {
-                    Db::getInstance()->execute('ROLLBACK');
+                    $db->execute('ROLLBACK');
+                    if ($e->getCode() != self::ERR_NO_PRODUCTS) {
+                        throw $e;
+                    }
+                    // Ningún producto existe en la madre: se marcan como procesados sin crear pedido
+                    $noProducts = true;
+                    $this->markBatchProcessed($idShop, $inIds, 0);
+                    $this->log('Lote de ' . $shop['name'] . ' marcado como procesado sin pedido: ' . $e->getMessage());
+                } catch (Throwable $e) {
+                    // Errores fatales de PHP 7+ (TypeError...): se deshace todo y los pedidos siguen pendientes
+                    $db->execute('ROLLBACK');
+                    throw new Exception($e->getMessage() . ' (' . basename($e->getFile()) . ':' . $e->getLine() . ')');
+                }
+
+                if ($orderId) {
                     $processResults[] = array(
                         'shop' => $shop['name'],
-                        'status' => 'error',
-                        'message' => $e->getMessage()
+                        'order_id' => $orderId,
+                        'products_count' => $validProducts,
+                        'orders_count' => count($orderIds),
+                        'status' => 'success',
+                    );
+                } elseif ($noProducts) {
+                    $processResults[] = array(
+                        'shop' => $shop['name'],
+                        'status' => 'success',
+                        'orders_count' => count($orderIds),
+                        'message' => 'Procesado sin crear pedido (ningún producto encontrado en la tienda madre)',
                     );
                 }
             } catch (Exception $e) {
+                $this->log('✗ Error procesando ' . $shop['name'] . ' (los pedidos siguen pendientes): ' . $e->getMessage());
                 $processResults[] = array(
                     'shop' => $shop['name'],
                     'status' => 'error',
-                    'message' => 'Error general: ' . $e->getMessage()
+                    'message' => $e->getMessage() . ' (los pedidos siguen pendientes)',
                 );
             }
         }
@@ -473,359 +860,379 @@ foreach ($products as $prod) {
     }
 
     /**
-     * NUEVO: Buscar producto por referencia con cache
+     * Desde cron (línea de comandos) el contexto no tiene moneda, idioma ni país:
+     * sin ellos PrestaShop falla al calcular precios del carrito.
      */
-private function findProductByReference($reference)
-{
-    if (empty($reference)) {
-        return null;
-    }
-    
-    $reference = trim($reference);
-    
-    // Verificar cache
-    if (isset($this->productCache[$reference])) {
-        return $this->productCache[$reference];
-    }
-    
-    $result = null;
-    
-    // 1. Buscar combinación por referencia primero
-    $sql = 'SELECT pa.id_product_attribute, pa.id_product FROM ' . _DB_PREFIX_ . 'product_attribute pa ' .
-           'JOIN ' . _DB_PREFIX_ . 'product p ON pa.id_product = p.id_product ' .
-           'WHERE pa.reference = "' . pSQL($reference) . '"';
-    
-    $this->log('SQL Combinación (sin LIMIT): ' . $sql);
-    $combinations = Db::getInstance()->executeS($sql);
-    
-    if (!empty($combinations)) {
-        $combination_data = $combinations[0]; // Tomar el primero
-        $result = array(
-            'id_product' => (int)$combination_data['id_product'],
-            'id_product_attribute' => (int)$combination_data['id_product_attribute'],
-            'type' => 'combination'
-        );
-        $this->log('Producto encontrado (combinación): "' . $reference . '" -> ID: ' . $result['id_product'] . ', Combinación: ' . $result['id_product_attribute']);
-    } else {
-        // 2. Buscar producto simple
-        $sql2 = 'SELECT id_product FROM ' . _DB_PREFIX_ . 'product ' .
-                'WHERE reference = "' . pSQL($reference) . '"';
-        
-        $this->log('SQL Producto (sin LIMIT): ' . $sql2);
-        $products = Db::getInstance()->executeS($sql2);
-        
-        if (!empty($products)) {
-            $result = array(
-                'id_product' => (int)$products[0]['id_product'],
-                'id_product_attribute' => 0,
-                'type' => 'simple'
-            );
-            $this->log('Producto encontrado (simple): "' . $reference . '" -> ID: ' . $result['id_product']);
-        } else {
-            $this->log('Producto no encontrado: "' . $reference . '"');
+    private function ensureContext()
+    {
+        $context = Context::getContext();
+        if (!$context->shop || !$context->shop->id) {
+            $context->shop = new Shop((int) Configuration::get('PS_SHOP_DEFAULT'));
+        }
+        if (!$context->language || !$context->language->id) {
+            $context->language = new Language((int) Configuration::get('PS_LANG_DEFAULT'));
+        }
+        if (!$context->currency || !$context->currency->id) {
+            $context->currency = new Currency((int) Configuration::get('PS_CURRENCY_DEFAULT'));
+        }
+        if (!$context->country || !$context->country->id) {
+            $context->country = new Country((int) Configuration::get('PS_COUNTRY_DEFAULT'));
+        }
+        if (!$context->link) {
+            $context->link = new Link();
         }
     }
-    
-    // Guardar en cache
-    $this->productCache[$reference] = $result;
-    
-    return $result;
-}
-private function debugProductSearch($reference)
-{
-    error_log('=== DEBUG BÚSQUEDA DE PRODUCTO ===');
-    error_log('Buscando referencia: "' . $reference . '"');
-    
-    // Buscar en combinaciones
-    $combinations = Db::getInstance()->executeS(
-        'SELECT pa.id_product_attribute, pa.id_product, pa.reference, p.reference as product_ref, p.active
-         FROM `' . _DB_PREFIX_ . 'product_attribute` pa
-         JOIN `' . _DB_PREFIX_ . 'product` p ON pa.id_product = p.id_product
-         WHERE pa.reference = "' . pSQL($reference) . '"'
-    );
-    
-    error_log('Combinaciones encontradas: ' . count($combinations));
-    foreach ($combinations as $comb) {
-        error_log('- Combinación ID: ' . $comb['id_product_attribute'] . ', Producto ID: ' . $comb['id_product'] . ', Activo: ' . $comb['active']);
+
+    /** Marca como procesadas las líneas y el tracking de los pedidos del lote (y solo esos) */
+    private function markBatchProcessed($idShop, $inIds, $motherOrderId)
+    {
+        $db = Db::getInstance();
+        $db->execute(
+            'UPDATE `' . _DB_PREFIX_ . 'syncrosevi_order_lines`
+             SET processed = 1
+             WHERE id_child_shop = ' . (int) $idShop . ' AND processed = 0
+             AND id_original_order IN (' . $inIds . ')'
+        );
+        $db->execute(
+            'UPDATE `' . _DB_PREFIX_ . 'syncrosevi_order_tracking`
+             SET id_mother_order = ' . (int) $motherOrderId . ',
+                 processed = 1,
+                 date_processed = "' . date('Y-m-d H:i:s') . '"
+             WHERE id_child_shop = ' . (int) $idShop . ' AND processed = 0
+             AND id_original_order IN (' . $inIds . ')'
+        );
     }
-    
-    // Buscar en productos simples
-    $products = Db::getInstance()->executeS(
-        'SELECT id_product, reference, active
-         FROM `' . _DB_PREFIX_ . 'product` 
-         WHERE reference = "' . pSQL($reference) . '"'
-    );
-    
-    error_log('Productos simples encontrados: ' . count($products));
-    foreach ($products as $prod) {
-        error_log('- Producto ID: ' . $prod['id_product'] . ', Activo: ' . $prod['active']);
+
+    /**
+     * ======================================================================
+     * WEBHOOK
+     * ======================================================================
+     */
+
+    /**
+     * Verificar firma de webhook de seguridad
+     */
+    public function verifyWebhookSignature($shopId, $orderId, $newState, $timestamp, $receivedSignature)
+    {
+        $secret = Db::getInstance()->getValue(
+            'SELECT webhook_secret FROM `' . _DB_PREFIX_ . 'syncrosevi_child_shops`
+             WHERE id_child_shop = ' . (int) $shopId
+        );
+        if (!$secret) {
+            $this->log('Webhook rechazado: la tienda ' . (int) $shopId . ' no existe o no tiene clave secreta');
+
+            return false;
+        }
+
+        $expected = hash_hmac('sha256', $shopId . $orderId . $newState . $timestamp, $secret);
+        if (!is_string($receivedSignature) || !hash_equals($expected, $receivedSignature)) {
+            $this->log('Webhook rechazado: firma no válida (tienda ' . (int) $shopId . ', pedido ' . (int) $orderId . ')');
+
+            return false;
+        }
+
+        return true;
     }
-    
-    error_log('=== FIN DEBUG ===');
-}
+
+    /**
+     * Sincronizar un pedido específico en tiempo real (llamado por el webhook de la tienda hija)
+     */
+    public function syncSingleOrderRealtime($shopId, $orderId, $newState)
+    {
+        $this->loadWebservice();
+
+        try {
+            $shop = Db::getInstance()->getRow(
+                'SELECT * FROM `' . _DB_PREFIX_ . 'syncrosevi_child_shops`
+                 WHERE id_child_shop = ' . (int) $shopId . ' AND active = 1'
+            );
+            if (!$shop) {
+                throw new Exception('Tienda no encontrada o inactiva: ' . $shopId);
+            }
+            if (!$shop['realtime_enabled']) {
+                $this->log('Webhook ignorado: la tienda ' . $shop['name'] . ' tiene desactivado el tiempo real', true);
+
+                return false;
+            }
+
+            // Modo clonar: si el pedido ya está clonado, el aviso es un cambio de estado
+            if (self::isCloneShop($shop)) {
+                $clone = Db::getInstance()->getRow(
+                    'SELECT id_mother_order, child_state FROM `' . _DB_PREFIX_ . 'syncrosevi_order_tracking`
+                     WHERE id_original_order = ' . (int) $orderId . ' AND id_child_shop = ' . (int) $shopId . '
+                     AND processed = 1 AND is_clone = 1 AND id_mother_order > 0'
+                );
+                if ($clone) {
+                    if ((int) $clone['child_state'] === (int) $newState) {
+                        return false; // ya lo tenemos (p. ej. lo acaba de poner la propia madre)
+                    }
+
+                    return $this->applyCloneState($shop, (int) $orderId, (int) $clone['id_mother_order'], (int) $newState);
+                }
+            }
+            if (!in_array((int) $newState, self::parseStates($shop['import_states']))) {
+                $this->log('Webhook: estado ' . $newState . ' no está en la lista de importación de ' . $shop['name'], true);
+
+                return false;
+            }
+            if ((int) $orderId < (int) $shop['start_order_id']) {
+                return false;
+            }
+
+            $existing = Db::getInstance()->getValue(
+                'SELECT id_tracking FROM `' . _DB_PREFIX_ . 'syncrosevi_order_tracking`
+                 WHERE id_original_order = ' . (int) $orderId . ' AND id_child_shop = ' . (int) $shopId
+            );
+            if ($existing) {
+                $this->log('Webhook: pedido #' . $orderId . ' de ' . $shop['name'] . ' ya estaba sincronizado', true);
+
+                return false;
+            }
+
+            // Solo se pide ese pedido a la tienda hija
+            $webservice = new SyncroSeviWebservice($shop['url'], $shop['api_key'], $this->isDebug());
+            $orders = $webservice->getOrdersByIds(array((int) $orderId), $shop['import_states']);
+            if (empty($orders)) {
+                throw new Exception('Pedido ' . $orderId . ' no encontrado en la tienda ' . $shop['name'] . ' (o su estado no se importa)');
+            }
+
+            if ($this->syncOrderToTemp($orders[0], $shop)) {
+                Db::getInstance()->execute(
+                    'UPDATE `' . _DB_PREFIX_ . 'syncrosevi_order_tracking`
+                     SET realtime_sync = 1, date_realtime = "' . date('Y-m-d H:i:s') . '"
+                     WHERE id_original_order = ' . (int) $orderId . ' AND id_child_shop = ' . (int) $shopId
+                );
+                $this->log('✓ TIEMPO REAL: pedido #' . $orderId . ' de ' . $shop['name'] . ' sincronizado');
+
+                return true;
+            }
+
+            return false;
+        } catch (Exception $e) {
+            $this->log('✗ TIEMPO REAL: tienda ' . $shopId . ' pedido ' . $orderId . ': ' . $e->getMessage());
+
+            return false;
+        }
+    }
+
+    /**
+     * Atiende una petición al webhook (la usan el controlador de módulo y el webhook.php antiguo)
+     *
+     * @return array array(código HTTP, datos de la respuesta)
+     */
+    public function handleWebhookRequest()
+    {
+        $action = (string) Tools::getValue('action', '');
+        $expected = (string) Configuration::get('SYNCROSEVI_WEBHOOK_TOKEN');
+        $token = (string) Tools::getValue('security_token', '');
+
+        if ($expected === '') {
+            return array(500, array('success' => false, 'error' => 'Webhook token not configured. Please reinstall the module.'));
+        }
+        if (!hash_equals($expected, $token)) {
+            return array(403, array('success' => false, 'error' => 'Invalid security token'));
+        }
+        if (!$this->active) {
+            return array(503, array('success' => false, 'error' => 'SyncroSevi module is inactive'));
+        }
+        if (!$this->getUpdater()->ready()) {
+            return array(403, array('success' => false, 'error' => 'SyncroSevi is not enabled for this shop'));
+        }
+
+        try {
+            switch ($action) {
+                case 'sync':
+                    $results = $this->syncOrders();
+
+                    return array(200, array(
+                        'success' => true,
+                        'action' => 'sync',
+                        'results' => $results,
+                        'count' => count($results),
+                        'timestamp' => date('Y-m-d H:i:s'),
+                    ));
+
+                case 'process':
+                    $batchLimit = (int) Configuration::get('SYNCROSEVI_BATCH_LIMIT') ?: 10;
+                    $results = $this->processOrders($batchLimit);
+
+                    return array(200, array(
+                        'success' => true,
+                        'action' => 'process',
+                        'results' => $results,
+                        'count' => count($results),
+                        'batch_limit' => $batchLimit,
+                        'timestamp' => date('Y-m-d H:i:s'),
+                    ));
+
+                case 'realtime_sync':
+                    $shopId = (int) Tools::getValue('shop_id');
+                    $orderId = (int) Tools::getValue('order_id');
+                    $newState = (int) Tools::getValue('new_state');
+                    $timestamp = (int) Tools::getValue('timestamp');
+                    $signature = (string) Tools::getValue('signature', '');
+
+                    // Máximo 5 minutos de diferencia entre servidores
+                    if (abs(time() - $timestamp) > 300) {
+                        throw new Exception('Webhook timestamp too old (revisa la hora de los servidores)');
+                    }
+                    if (!$this->verifyWebhookSignature($shopId, $orderId, $newState, $timestamp, $signature)) {
+                        return array(403, array('success' => false, 'error' => 'Invalid webhook signature'));
+                    }
+
+                    Db::getInstance()->update('syncrosevi_child_shops', array('last_webhook' => date('Y-m-d H:i:s')), 'id_child_shop = ' . (int) $shopId);
+
+                    if (Tools::getValue('test_mode') || $orderId <= 0) {
+                        return array(200, array(
+                            'success' => true,
+                            'action' => 'realtime_sync',
+                            'test' => true,
+                            'message' => 'Conexión correcta con la tienda madre',
+                            'shop_id' => $shopId,
+                            'timestamp' => date('Y-m-d H:i:s'),
+                        ));
+                    }
+
+                    $result = $this->syncSingleOrderRealtime($shopId, $orderId, $newState);
+
+                    return array(200, array(
+                        'success' => true,
+                        'action' => 'realtime_sync',
+                        'shop_id' => $shopId,
+                        'order_id' => $orderId,
+                        'new_state' => $newState,
+                        'synced' => $result,
+                        'timestamp' => date('Y-m-d H:i:s'),
+                    ));
+
+                case 'test':
+                    return array(200, array(
+                        'success' => true,
+                        'action' => 'test',
+                        'message' => 'Webhook funcionando correctamente',
+                        'prestashop_version' => _PS_VERSION_,
+                        'module_version' => $this->version,
+                        'timestamp' => date('Y-m-d H:i:s'),
+                    ));
+
+                default:
+                    throw new Exception('Invalid action: ' . $action . '. Valid actions: sync, process, realtime_sync, test');
+            }
+        } catch (Exception $e) {
+            return array(500, array(
+                'success' => false,
+                'error' => $e->getMessage(),
+                'action' => $action,
+                'timestamp' => date('Y-m-d H:i:s'),
+            ));
+        }
+    }
+
+    /**
+     * ======================================================================
+     * CREACIÓN DEL PEDIDO MADRE
+     * ======================================================================
+     */
+
+    /**
+     * Buscar producto por referencia/código (EAN13, UPC, ISBN) con caché.
+     * Nunca se busca por ID: los IDs de la tienda hija no tienen relación con los de la madre.
+     */
+    public function findProductByReference($reference)
+    {
+        $reference = trim((string) $reference);
+        if ($reference === '') {
+            return null;
+        }
+        if (array_key_exists($reference, $this->productCache)) {
+            return $this->productCache[$reference];
+        }
+
+        $db = Db::getInstance();
+        $ref = pSQL($reference);
+        $result = null;
+
+        // 1. Combinación por referencia
+        $row = $db->getRow(
+            'SELECT pa.id_product_attribute, pa.id_product FROM `' . _DB_PREFIX_ . 'product_attribute` pa
+             JOIN `' . _DB_PREFIX_ . 'product` p ON pa.id_product = p.id_product
+             WHERE pa.reference = "' . $ref . '" AND p.active = 1'
+        );
+        if ($row) {
+            $result = array('id_product' => (int) $row['id_product'], 'id_product_attribute' => (int) $row['id_product_attribute'], 'type' => 'combination', 'found_by' => 'combination_reference');
+        }
+
+        // 2. Combinación por código (ean13, upc, isbn)
+        if (!$result) {
+            $row = $db->getRow(
+                'SELECT pa.id_product_attribute, pa.id_product FROM `' . _DB_PREFIX_ . 'product_attribute` pa
+                 JOIN `' . _DB_PREFIX_ . 'product` p ON pa.id_product = p.id_product
+                 WHERE (pa.ean13 = "' . $ref . '" OR pa.upc = "' . $ref . '" OR pa.isbn = "' . $ref . '") AND p.active = 1'
+            );
+            if ($row) {
+                $result = array('id_product' => (int) $row['id_product'], 'id_product_attribute' => (int) $row['id_product_attribute'], 'type' => 'combination', 'found_by' => 'combination_code');
+            }
+        }
+
+        // 3. Producto simple por referencia
+        if (!$result) {
+            $id = (int) $db->getValue('SELECT id_product FROM `' . _DB_PREFIX_ . 'product` WHERE reference = "' . $ref . '" AND active = 1');
+            if ($id) {
+                $result = array('id_product' => $id, 'id_product_attribute' => 0, 'type' => 'simple', 'found_by' => 'product_reference');
+            }
+        }
+
+        // 4. Producto simple por código
+        if (!$result) {
+            $id = (int) $db->getValue(
+                'SELECT id_product FROM `' . _DB_PREFIX_ . 'product`
+                 WHERE (ean13 = "' . $ref . '" OR upc = "' . $ref . '" OR isbn = "' . $ref . '") AND active = 1'
+            );
+            if ($id) {
+                $result = array('id_product' => $id, 'id_product_attribute' => 0, 'type' => 'simple', 'found_by' => 'product_code');
+            }
+        }
+
+        if ($result) {
+            $this->log('✓ "' . $reference . '" -> producto ' . $result['id_product'] . ' / combinación ' . $result['id_product_attribute'] . ' (' . $result['found_by'] . ')', true);
+        } else {
+            $this->log('✗ Producto NO encontrado en la tienda madre: "' . $reference . '"');
+        }
+
+        $this->productCache[$reference] = $result;
+
+        return $result;
+    }
+
     private function validateCustomer($customerId)
     {
-        $customer = new Customer($customerId);
+        $customer = new Customer((int) $customerId);
         if (!Validate::isLoadedObject($customer)) {
-            throw new Exception('Cliente ID ' . $customerId . ' no encontrado');
+            throw new Exception('Cliente ID ' . (int) $customerId . ' no encontrado');
         }
+
         return $customer;
     }
 
     private function validateAddress($addressId, $customerId)
     {
-        $address = new Address($addressId);
-        if (!Validate::isLoadedObject($address)) {
-            throw new Exception('Dirección ID ' . $addressId . ' no encontrada');
+        $address = new Address((int) $addressId);
+        if (!Validate::isLoadedObject($address) || $address->deleted) {
+            throw new Exception('Dirección ID ' . (int) $addressId . ' no encontrada');
         }
-        
         if ($address->id_customer != $customerId) {
             throw new Exception('La dirección no pertenece al cliente especificado');
         }
-        
+
         return $address;
     }
 
-    private function createTempCart($customer, $address, $shop)
-{
-    // Asegurar contexto de empleado
-    if (!Context::getContext()->employee) {
-        Context::getContext()->employee = new Employee(1);
-    }
-    
-    $cart = new Cart();
-    $cart->id_customer = $customer->id;
-    $cart->id_address_delivery = $address->id;
-    $cart->id_address_invoice = $address->id;
-    $cart->id_lang = Configuration::get('PS_LANG_DEFAULT');
-    $cart->id_currency = Configuration::get('PS_CURRENCY_DEFAULT');
-    $cart->id_shop = Configuration::get('PS_SHOP_DEFAULT');
-    $cart->id_shop_group = Shop::getGroupFromShop($cart->id_shop);
-    
-    // Asignar transportista (solo para que el carrito sea válido)
-    if (!empty($shop['id_carrier']) && $shop['id_carrier'] > 0) {
-        // Verificar que existe y está activo
-        $carrier = new Carrier($shop['id_carrier']);
-        if (Validate::isLoadedObject($carrier) && $carrier->active) {
-            $cart->id_carrier = (int)$shop['id_carrier'];
-        } else {
-            // Si no es válido, usar uno por defecto pero será gratis
-            $cart->id_carrier = $this->getAnyValidCarrier();
-        }
-    } else {
-        // Sin transportista específico = usar uno cualquiera (será gratis)
-        $cart->id_carrier = $this->getAnyValidCarrier();
-    }
-    
-    $this->log('Carrito creado - Transportista configurado: ' . ($shop['id_carrier'] ?: 'Ninguno') . ', Transportista asignado: ' . $cart->id_carrier);
-    
-    if (!$cart->add()) {
-        throw new Exception('Error al crear carrito temporal');
-    }
-    
-    return $cart;
-}
-	private function getAnyValidCarrier()
-{
-    // Intentar transportista por defecto
-    $defaultCarrierId = (int)Configuration::get('PS_CARRIER_DEFAULT');
-    if ($defaultCarrierId > 0) {
-        $carrier = new Carrier($defaultCarrierId);
-        if (Validate::isLoadedObject($carrier) && $carrier->active) {
-            return $defaultCarrierId;
-        }
-    }
-    
-    // Buscar cualquier transportista activo
-    $carriers = Carrier::getCarriers(Configuration::get('PS_LANG_DEFAULT'), true);
-    if (!empty($carriers)) {
-        return (int)$carriers[0]['id_carrier'];
-    }
-    
-    throw new Exception('No hay transportistas disponibles');
-}
-	/**
-     * CORREGIDO: Calcular datos de pedido con búsqueda mejorada de productos
-     */
-private function calculateOrderData($products, $shop, $cart, $address)
-{
-    $this->log('DEBUG - calculateOrderData: Iniciando cálculo para ' . count($products) . ' productos');
-    
-    $total_products_tax_excl = 0;
-    $total_products_tax_incl = 0;
-    $products_details = array();
-    
-    // Obtener descuento del grupo
-    $group_reduction = 0;
-    if ($shop['id_group']) {
-        $group = new Group($shop['id_group']);
-        if (Validate::isLoadedObject($group)) {
-            $group_reduction = (float)$group->reduction;
-        }
-    }
-    
-    foreach ($products as $product) {
-        $reference = trim($product['product_reference']);
-        
-        if (empty($reference)) {
-            $this->log('Saltando producto sin referencia: ' . $product['product_name']);
-            continue;
-        }
-        
-        $this->log('Buscando producto con referencia: "' . $reference . '"');
-        $productFound = $this->findProductByReference($reference);
-        
-        if (!$productFound) {
-            $this->log('Producto NO encontrado en tienda madre: "' . $reference . '" (Producto: ' . $product['product_name'] . ') - SALTANDO');
-            continue;
-        }
-
-        $this->log('Producto SÍ encontrado "' . $reference . '" -> ID: ' . $productFound['id_product'] . ' (Tipo: ' . $productFound['type'] . ')');
-                
-        $id_product_found = $productFound['id_product'];
-        $id_product_attribute_found = $productFound['id_product_attribute'];
-        
-        // Cargar producto para obtener precios
-        $product_obj = new Product($id_product_found, false, $cart->id_lang);
-        if (!Validate::isLoadedObject($product_obj)) {
-            $this->log('No se pudo cargar el objeto Product para ID: ' . $id_product_found);
-            continue;
-        }
-        
-        // Verificar que el producto esté activo
-// if (!$product_obj->active) {
-//     $this->log('Producto inactivo: ' . $reference);
-//     continue;
-// }
-        
-        // Obtener precio base del producto
-        $base_price_tax_excl = $product_obj->getPrice(false, $id_product_attribute_found, 6, null, false, false);
-        $base_price_tax_incl = $product_obj->getPrice(true, $id_product_attribute_found, 6, null, false, false);
-
-        // Aplicar descuento del grupo si existe
-        if ($group_reduction > 0) {
-            $unit_price_tax_excl = $base_price_tax_excl * (1 - ($group_reduction / 100));
-            $unit_price_tax_incl = $base_price_tax_incl * (1 - ($group_reduction / 100));
-        } else {
-            $unit_price_tax_excl = $base_price_tax_excl;
-            $unit_price_tax_incl = $base_price_tax_incl;
-        }
-        
-        $line_total_tax_excl = $unit_price_tax_excl * $product['quantity'];
-        $line_total_tax_incl = $unit_price_tax_incl * $product['quantity'];
-        
-        $total_products_tax_excl += $line_total_tax_excl;
-        $total_products_tax_incl += $line_total_tax_incl;
-        
-        $products_details[] = array(
-            'id_product' => $id_product_found,
-            'id_product_attribute' => $id_product_attribute_found,
-            'product_name' => $product['product_name'],
-            'product_reference' => $reference,
-            'quantity' => $product['quantity'],
-            'unit_price_tax_excl' => $unit_price_tax_excl,
-            'unit_price_tax_incl' => $unit_price_tax_incl,
-            'total_price_tax_excl' => $line_total_tax_excl,
-            'total_price_tax_incl' => $line_total_tax_incl,
-            'group_reduction' => $group_reduction,
-            'found_by' => $productFound['type']
-        );
-        
-        $this->log('Producto añadido al pedido: "' . $reference . '" Cantidad: ' . $product['quantity'] . ' Precio: ' . $unit_price_tax_excl);
-    }
-
-    $this->log('RESUMEN - Productos procesados: ' . count($products) . ', Productos válidos encontrados: ' . count($products_details));
-
-    // Calcular gastos de envío
-    $shipping_data = $this->calculateShippingCosts($shop, $products_details, $address, $total_products_tax_excl);
-
-    return array(
-        'products_details' => $products_details,
-        'total_products_tax_excl' => $total_products_tax_excl,
-        'total_products_tax_incl' => $total_products_tax_incl,
-        'total_shipping_tax_excl' => $shipping_data['tax_excl'],
-        'total_shipping_tax_incl' => $shipping_data['tax_incl'],
-        'total_paid_tax_excl' => $total_products_tax_excl + $shipping_data['tax_excl'],
-        'total_paid_tax_incl' => $total_products_tax_incl + $shipping_data['tax_incl']
-    );
-}
-
     /**
-     * CORREGIDO: Cálculo de transporte
+     * Crear pedido madre consolidado
+     *
+     * @return array array('id_order' => int, 'products' => int)
      */
-    private function calculateShippingCosts($shop, $products_details, $address, $total_products_tax_excl)
-    {
-        $total_shipping_tax_excl = 0;
-        $total_shipping_tax_incl = 0;
-
-        if (!empty($shop['id_carrier']) && $shop['id_carrier'] > 0) {
-            $carrier = new Carrier($shop['id_carrier']);
-            if (Validate::isLoadedObject($carrier) && $carrier->active) {
-                try {
-                    // Calcular peso total
-                    $total_weight = $this->calculateTotalWeight($products_details);
-                    
-                    // Obtener zona de entrega
-                    $country = new Country($address->id_country);
-                    $id_zone = $country->id_zone ?: 1;
-                    
-                    // Usar las tarifas reales del transportista
-                    $shipping_cost = $carrier->getDeliveryPriceByWeight($total_weight, $id_zone);
-                    
-                    // Si no hay tarifa por peso, probar por precio
-                    if ($shipping_cost <= 0) {
-                        $shipping_cost = $carrier->getDeliveryPriceByPrice($total_products_tax_excl, $id_zone);
-                    }
-                    
-                    $total_shipping_tax_excl = $shipping_cost;
-                    
-                    // Aplicar IVA del transportista
-                    $tax_rate = $this->getCarrierTaxRate($carrier, $address);
-                    $total_shipping_tax_incl = $total_shipping_tax_excl * (1 + ($tax_rate / 100));
-                    
-                } catch (Exception $e) {
-                    $this->log(': Error calculando envío: ' . $e->getMessage());
-                    $total_shipping_tax_excl = 0;
-                    $total_shipping_tax_incl = 0;
-                }
-            }
-        }
-        // Si no hay transportista configurado = ENVÍO GRATIS
-
-        return array(
-            'tax_excl' => round($total_shipping_tax_excl, 2),
-            'tax_incl' => round($total_shipping_tax_incl, 2)
-        );
-    }
-
-    private function calculateTotalWeight($products_details)
-    {
-        $total_weight = 0;
-        
-        foreach ($products_details as $detail) {
-            $product_obj = new Product($detail['id_product']);
-            if (Validate::isLoadedObject($product_obj)) {
-                $weight = $product_obj->weight > 0 ? $product_obj->weight : 0.1; // Mínimo 100g
-                $total_weight += ($weight * $detail['quantity']);
-            }
-        }
-        
-        return $total_weight;
-    }
-
-    private function getCarrierTaxRate($carrier, $address)
-    {
-        try {
-            return $carrier->getTaxesRate($address);
-        } catch (Exception $e) {
-            return 21; // IVA por defecto
-        }
-    }
-	
-	/**
-     * CORREGIDO: Crear pedido madre consolidado
-     */
-    private function createMotherOrder($products, $shop, $customer = null, $address = null, $cart = null)
+    private function createMotherOrder($products, $shop, $customer = null, $address = null)
     {
         if (!$customer) {
             $customer = $this->validateCustomer($shop['id_customer']);
@@ -833,1372 +1240,638 @@ private function calculateOrderData($products, $shop, $cart, $address)
         if (!$address) {
             $address = $this->validateAddress($shop['id_address'], $customer->id);
         }
-        if (!$cart) {
-            $cart = $this->createTempCart($customer, $address, $shop);
-        }
-        
-        // Calcular precios y productos
-        $orderData = $this->calculateOrderData($products, $shop, $cart, $address);
-            
-        if (empty($orderData['products_details'])) {
-            throw new Exception('No hay productos válidos para procesar');
-        }
-        
-        // Crear pedido principal
-        $order = $this->createOrder($customer, $cart, $address, $shop, $orderData);
-        
-        if ($order->add()) {
-            // Crear detalles del pedido
-            $this->createOrderDetails($order, $orderData['products_details'], $shop);
-            
-            // Crear historial de estados
-            $this->createOrderHistory($order);
-            
-            // Crear registro en ps_order_carrier
-            $this->createOrderCarrier($order, $shop, $orderData);
-            
-            // Actualizar stock si está activado
-            $this->updateProductStock($orderData['products_details']);
-            
-            return $order->id;
-        }
-        
-        throw new Exception('Error al crear el pedido en la base de datos');
-    }
 
-    private function createOrder($customer, $cart, $address, $shop, $orderData)
-    {
-        $order = new Order();
-        $order->id_customer = $customer->id;
-        $order->id_cart = $cart->id;
-        $order->id_currency = $cart->id_currency;
-        $order->id_lang = $cart->id_lang;
-        // Usar el mismo transportista que se usará en OrderCarrier
-if (!empty($shop['id_carrier']) && $shop['id_carrier'] > 0) {
-    $carrier = new Carrier($shop['id_carrier']);
-    if (Validate::isLoadedObject($carrier) && $carrier->active) {
-        $order->id_carrier = (int)$shop['id_carrier'];
-    } else {
-        $order->id_carrier = $this->getAnyValidCarrier();
-    }
-} else {
-    $order->id_carrier = $this->getAnyValidCarrier();
-}
-        $order->id_address_delivery = $address->id;
-        $order->id_address_invoice = $address->id;
-        $order->id_shop = Configuration::get('PS_SHOP_DEFAULT');
-        $order->id_shop_group = Shop::getGroupFromShop($order->id_shop);
-        $order->current_state = (int)$shop['id_order_state'];
-        $order->payment = 'SyncroSevi - ' . $shop['name'];
-        $order->module = 'syncrosevi';
-        $order->secure_key = $customer->secure_key;
-        $order->reference = Order::generateReference();
-        $order->conversion_rate = 1;
-        $order->valid = 1;
-        
-        // Todos los totales
-        $order->total_paid = $orderData['total_paid_tax_incl'];
-        $order->total_paid_tax_incl = $orderData['total_paid_tax_incl'];
-        $order->total_paid_tax_excl = $orderData['total_paid_tax_excl'];
-        $order->total_paid_real = $orderData['total_paid_tax_incl'];
-        $order->total_products = $orderData['total_products_tax_excl'];
-        $order->total_products_wt = $orderData['total_products_tax_incl'];
-        $order->total_shipping = $orderData['total_shipping_tax_incl'];
-        $order->total_shipping_tax_incl = $orderData['total_shipping_tax_incl'];
-        $order->total_shipping_tax_excl = $orderData['total_shipping_tax_excl'];
-        $order->total_discounts = 0;
-        $order->total_discounts_tax_incl = 0;
-        $order->total_discounts_tax_excl = 0;
-        $order->total_wrapping = 0;
-        $order->total_wrapping_tax_incl = 0;
-        $order->total_wrapping_tax_excl = 0;
-        $order->round_mode = Configuration::get('PS_PRICE_ROUND_MODE');
-        $order->round_type = Configuration::get('PS_ROUND_TYPE');
-        
-        return $order;
-    }
+        $cart = $this->createSimpleCart($customer, $address, $shop);
+        $validProducts = $this->addProductsToCart($cart, $products, $shop);
+        $this->configureCartShipping($cart, $shop);
+        $orderId = $this->createOrderFromCart($cart, $shop);
 
-    private function createOrderDetails($order, $products_details, $shop)
-    {
-        $default_warehouse = Configuration::get('PS_WAREHOUSE_DEFAULT') ?: 0;
-        
-        foreach ($products_details as $detail) {
-            $order_detail = new OrderDetail();
-            $order_detail->id_order = $order->id;
-            $order_detail->id_warehouse = $default_warehouse;
-            $order_detail->id_shop = $order->id_shop;
-            $order_detail->product_id = $detail['id_product'];
-            $order_detail->product_attribute_id = $detail['id_product_attribute'];
-            $order_detail->product_name = $detail['product_name'];
-            $order_detail->product_reference = $detail['product_reference'];
-            $order_detail->product_quantity = $detail['quantity'];
-            $order_detail->product_price = $detail['unit_price_tax_excl'];
-            $order_detail->unit_price_tax_incl = $detail['unit_price_tax_incl'];
-            $order_detail->unit_price_tax_excl = $detail['unit_price_tax_excl'];
-            $order_detail->total_price_tax_incl = $detail['total_price_tax_incl'];
-            $order_detail->total_price_tax_excl = $detail['total_price_tax_excl'];
-            $order_detail->product_quantity_in_stock = 1000;
-            $order_detail->product_quantity_refunded = 0;
-            $order_detail->product_quantity_return = 0;
-            $order_detail->product_quantity_reinjected = 0;
-            $order_detail->group_reduction = $detail['group_reduction'];
-            $order_detail->discount_quantity_applied = 0;
-            $order_detail->download_hash = '';
-            $order_detail->download_nb = 0;
-            $order_detail->download_deadline = null;
-            
-            if (!$order_detail->add()) {
-                throw new Exception('Error al crear detalle del pedido para producto ID: ' . $detail['id_product']);
-            }
-        }
-    }
+        $this->log('✓ Pedido madre #' . $orderId . ' creado para ' . $shop['name'] . ' con ' . $validProducts . ' productos');
 
-    private function createOrderHistory($order)
-    {
-        $order_history = new OrderHistory();
-        $order_history->id_order = $order->id;
-        $order_history->id_employee = 0;
-        $order_history->id_order_state = $order->current_state;
-        $order_history->date_add = date('Y-m-d H:i:s');
-        $order_history->add();
+        return array('id_order' => $orderId, 'products' => $validProducts);
     }
 
     /**
-     * CORREGIDO: Crear registro en ps_order_carrier
+     * Crear carrito
      */
-    private function createOrderCarrier($order, $shop, $orderData)
-{
-    try {
-        // Determinar qué transportista usar
-        if (!empty($shop['id_carrier']) && $shop['id_carrier'] > 0) {
-            $id_carrier = (int)$shop['id_carrier'];
-            $carrier = new Carrier($id_carrier);
-            
-            if (!Validate::isLoadedObject($carrier) || !$carrier->active) {
-                // Si el transportista configurado no es válido, usar uno por defecto pero gratis
-                $id_carrier = $this->getAnyValidCarrier();
-                $this->log('Transportista configurado no válido, usando por defecto: ' . $id_carrier);
-            }
-        } else {
-            // Sin transportista específico = usar uno por defecto (será gratis)
-            $id_carrier = $this->getAnyValidCarrier();
+    private function createSimpleCart($customer, $address, $shop)
+    {
+        $cart = new Cart();
+        $cart->id_customer = $customer->id;
+        // El cliente de la tienda hija usa el grupo de precios configurado
+        if ((int) $customer->id_default_group !== (int) $shop['id_group']) {
+            $customer->id_default_group = (int) $shop['id_group'];
+            $customer->update();
         }
-        
-        $order_carrier = new OrderCarrier();
-        $order_carrier->id_order = $order->id;
-        $order_carrier->id_carrier = $id_carrier;
-        $order_carrier->id_order_invoice = 0;
-        $order_carrier->weight = $this->calculateTotalWeight($orderData['products_details']);
-        $order_carrier->shipping_cost_tax_excl = $orderData['total_shipping_tax_excl'];
-        $order_carrier->shipping_cost_tax_incl = $orderData['total_shipping_tax_incl'];
-        $order_carrier->tracking_number = '';
-        $order_carrier->date_add = date('Y-m-d H:i:s');
-        
-        if ($order_carrier->add()) {
-            $this->log('OrderCarrier creado - Transportista: ' . $id_carrier . ', Coste: ' . $orderData['total_shipping_tax_incl']);
-        } else {
-            $this->log('Error creando OrderCarrier para pedido #' . $order->id);
-        }
-        
-    } catch (Exception $e) {
-        $this->log('Error en createOrderCarrier: ' . $e->getMessage());
-    }
-}
+        $cart->id_address_delivery = $address->id;
+        $cart->id_address_invoice = $address->id;
+        $cart->id_lang = (int) Configuration::get('PS_LANG_DEFAULT');
+        $cart->id_currency = (int) Configuration::get('PS_CURRENCY_DEFAULT');
+        $cart->id_shop = (int) Configuration::get('PS_SHOP_DEFAULT');
+        $cart->id_shop_group = (int) Shop::getGroupFromShop($cart->id_shop);
+        $cart->secure_key = $customer->secure_key;
 
-    private function updateProductStock($products_details)
-    {
-        if (Configuration::get('PS_STOCK_MANAGEMENT')) {
-            foreach ($products_details as $detail) {
-                StockAvailable::updateQuantity(
-                    $detail['id_product'],
-                    $detail['id_product_attribute'],
-                    -$detail['quantity']
-                );
-            }
+        if (!$cart->add()) {
+            throw new Exception('Error al crear carrito');
         }
-    }
-	
-	public function getContent()
-    {
-        $output = '';
-        
-        // Procesar formularios
-        if (Tools::isSubmit('submitAddShop')) {
-            $output .= $this->processAddShop();
-        } elseif (Tools::isSubmit('submitEditShop')) {
-            $output .= $this->processEditShop();
-        } elseif (Tools::isSubmit('submitSyncOrders')) {
-            $output .= $this->processSyncOrders();
-        } elseif (Tools::isSubmit('submitProcessOrders')) {
-            $output .= $this->processOrdersAction();
-        } elseif (Tools::isSubmit('submitViewPending')) {
-            return $this->processViewPending();
-        } elseif (Tools::getValue('action') == 'delete') {
-            $output .= $this->processDeleteShop();
-        } elseif (Tools::getValue('action') == 'edit') {
-            return $this->showEditForm();
-        } elseif (Tools::getValue('action') == 'test') {
-            $this->processTestConnection();
-            return;
-        } elseif (Tools::getValue('action') == 'get_states') {
-            $this->getChildShopStates();
-            return;
-        } elseif (Tools::getValue('action') == 'webhook') {
-            $this->processWebhook();
-            return;
-        }
-        
-        $output .= $this->displayConfigurationForm();
-        return $output;
+
+        $this->log('Carrito creado con ID: ' . $cart->id, true);
+
+        return $cart;
     }
 
-    protected function processWebhook()
+    /**
+     * Añadir productos al carrito (los que no existen en la madre se omiten)
+     */
+    private function addProductsToCart($cart, $products, $shop)
     {
-        $action = Tools::getValue('webhook_action');
-        $security = Tools::getValue('security_token');
-        
-        // Token de seguridad mejorado (mensual en lugar de diario)
-        $expected_token = md5('syncrosevi_' . Configuration::get('PS_SHOP_NAME') . '_' . Configuration::get('PS_SHOP_EMAIL') . '_' . date('Y-m'));
-        
-        if ($security !== $expected_token) {
-            header('HTTP/1.1 403 Forbidden');
-            die(json_encode(array('error' => 'Invalid security token')));
+        $addedCount = 0;
+        $notFoundCount = 0;
+
+        $customer = new Customer($cart->id_customer);
+        $context = Context::getContext();
+        $context->customer = $customer;
+        $context->cart = $cart;
+
+        $shopObject = new Shop($cart->id_shop);
+
+        // Más memoria para pedidos grandes, pero sin bajar nunca el límite actual
+        $currentMemoryLimit = ini_get('memory_limit');
+        if ($currentMemoryLimit != -1 && Tools::getOctets($currentMemoryLimit) < 805306368) {
+            @ini_set('memory_limit', '768M');
         }
-        
-        header('Content-Type: application/json');
-        
+
+        foreach ($products as $product) {
+            $reference = trim($product['product_reference']);
+            if ($reference === '') {
+                ++$notFoundCount;
+                $this->log('Línea sin referencia omitida: "' . $product['product_name'] . '"');
+                continue;
+            }
+
+            $productFound = $this->findProductByReference($reference);
+            if (!$productFound) {
+                ++$notFoundCount;
+                continue;
+            }
+
+            $this->ensureProductStock($productFound['id_product'], $productFound['id_product_attribute'], (int) $product['quantity']);
+
+            $result = $cart->updateQty(
+                (int) $product['quantity'],
+                $productFound['id_product'],
+                $productFound['id_product_attribute'],
+                false,
+                'up',
+                $cart->id_address_delivery,
+                $shopObject,
+                false
+            );
+
+            if ($result && $result > 0) {
+                ++$addedCount;
+                $this->log('✓ "' . $reference . '" añadido (cantidad: ' . $product['quantity'] . ')', true);
+            } else {
+                ++$notFoundCount;
+                $this->log('✗ No se pudo añadir "' . $reference . '" al carrito (cantidad mínima o producto no disponible)');
+            }
+
+            if ($addedCount > 0 && $addedCount % 10 == 0) {
+                gc_collect_cycles();
+            }
+        }
+
+        if ($currentMemoryLimit !== false) {
+            @ini_set('memory_limit', $currentMemoryLimit);
+        }
+
+        $this->log('RESUMEN carrito ' . $cart->id . ': ' . $addedCount . ' productos añadidos, ' . $notFoundCount . ' omitidos');
+
+        if ($addedCount === 0) {
+            throw new Exception('No se pudo añadir NINGÚN producto al carrito', self::ERR_NO_PRODUCTS);
+        }
+
+        return $addedCount;
+    }
+
+    /**
+     * Configurar transportista del carrito
+     */
+    private function configureCartShipping($cart, $shop)
+    {
+        $carrierId = null;
+
+        if (!empty($shop['id_carrier'])) {
+            $carrier = new Carrier((int) $shop['id_carrier']);
+            if (Validate::isLoadedObject($carrier) && $carrier->active && !$carrier->deleted) {
+                $carrierId = (int) $shop['id_carrier'];
+            } else {
+                $this->log('Transportista configurado no válido para ' . $shop['name'] . ', se usa el gratuito');
+            }
+        }
+
+        if (!$carrierId) {
+            $carrierId = (int) Configuration::get('SYNCROSEVI_FREE_CARRIER_ID');
+            if (!$carrierId) {
+                throw new Exception('Transportista gratuito de SyncroSevi no encontrado');
+            }
+        }
+
+        $cart->id_carrier = $carrierId;
+        $cart->setDeliveryOption(array($cart->id_address_delivery => $carrierId . ','));
+        $cart->update();
+
+        $this->log('Transportista ' . $carrierId . ' asignado al carrito ' . $cart->id, true);
+    }
+
+    /**
+     * Asegurar que el producto se puede pedir: si no admite pedidos sin stock y falta stock,
+     * se suma exactamente lo que falta (antes se sumaban 100 unidades de más que quedaban como stock ficticio).
+     */
+    public function ensureProductStock($productId, $attributeId, $requiredQty)
+    {
+        $currentStock = (int) StockAvailable::getQuantityAvailableByProduct($productId, $attributeId);
+        if ($currentStock >= $requiredQty) {
+            return;
+        }
+        if (Product::isAvailableWhenOutOfStock(StockAvailable::outOfStock($productId))) {
+            return; // admite pedidos sin stock: no hace falta tocar nada
+        }
+
+        $neededStock = $requiredQty - $currentStock;
+        StockAvailable::updateQuantity($productId, $attributeId, $neededStock, Context::getContext()->shop->id);
+        $this->log('Stock ajustado para producto ' . $productId . ' (combinación ' . $attributeId . '): +' . $neededStock . ' unidades');
+    }
+
+    /**
+     * Crear pedido desde carrito usando el módulo de pago interno
+     */
+    private function createOrderFromCart($cart, $shop)
+    {
+        $cartTotal = $cart->getOrderTotal(true);
+
+        if ($this->isDebug()) {
+            $this->log('Carrito ' . $cart->id . ': productos=' . $cart->getOrderTotal(false, Cart::ONLY_PRODUCTS) . ', envío=' . $cart->getOrderTotal(false, Cart::ONLY_SHIPPING) . ', total=' . $cartTotal, true);
+        }
+
+        if ($cartTotal <= 0) {
+            throw new Exception('El carrito tiene un total de 0, no se puede crear el pedido', self::ERR_NO_PRODUCTS);
+        }
+        if (!$cart->id || $cart->orderExists()) {
+            throw new Exception('El carrito no es válido o ya tiene un pedido asociado');
+        }
+
+        require_once dirname(__FILE__) . '/classes/SyncroSeviPayment.php';
+        $paymentModule = new SyncroSeviPayment();
+        $paymentModule->context = Context::getContext();
+        $paymentModule->context->cart = $cart;
+        $paymentModule->context->customer = new Customer($cart->id_customer);
+
+        $cart->update();
+
+        $result = $paymentModule->validateOrder(
+            $cart->id,
+            (int) $shop['id_order_state'],
+            $cartTotal,
+            'SyncroSevi - ' . $shop['name'],
+            'Pedido consolidado de ' . $shop['name'] . ' - Fecha: ' . date('Y-m-d H:i:s'),
+            array(),
+            (int) $cart->id_currency,
+            false,
+            $cart->secure_key
+        );
+
+        if ($result && $paymentModule->currentOrder) {
+            return (int) $paymentModule->currentOrder;
+        }
+
+        throw new Exception('Error al crear pedido desde carrito - ValidateOrder falló' . ($paymentModule->lastError ? ': ' . $paymentModule->lastError : ''));
+    }
+
+    /**
+     * ======================================================================
+     * MODO CLONAR
+     * ======================================================================
+     */
+
+    public static function isCloneShop($shop)
+    {
+        return isset($shop['sync_mode']) && $shop['sync_mode'] === 'clone';
+    }
+
+    /** Cambios de estado de la hija a la madre (1 = hija → madre, 2 = madre → hija, 3 = las dos) */
+    public static function syncIn($shop)
+    {
+        return isset($shop['clone_state_sync']) && in_array((int) $shop['clone_state_sync'], array(1, 3));
+    }
+
+    public static function syncOut($shop)
+    {
+        return isset($shop['clone_state_sync']) && in_array((int) $shop['clone_state_sync'], array(2, 3));
+    }
+
+    /**
+     * Madre → hija: al cambiar el estado de un pedido clonado en la madre, se cambia el de la hija según el mapeo
+     */
+    public function hookActionOrderHistoryAddAfter($params)
+    {
+        if (!$this->getUpdater()->ready()) {
+            return;
+        }
+        if (self::$noPush > 0 || !(int) Configuration::getGlobalValue('SYNCROSEVI_CLONE_ACTIVE')) {
+            return;
+        }
+        if (!isset($params['order_history']) || !($params['order_history'] instanceof OrderHistory)) {
+            return;
+        }
+        $history = $params['order_history'];
         try {
-            switch ($action) {
-                case 'sync':
-                    $results = $this->syncOrders();
-                    die(json_encode(array('success' => true, 'results' => $results)));
-                    break;
-                    
-                case 'process':
-                    $results = $this->processOrders();
-                    die(json_encode(array('success' => true, 'results' => $results)));
-                    break;
-                    
-                default:
-                    die(json_encode(array('error' => 'Invalid action')));
+            $row = Db::getInstance()->getRow(
+                'SELECT t.id_original_order, t.child_state, cs.*
+                 FROM `' . _DB_PREFIX_ . 'syncrosevi_order_tracking` t
+                 JOIN `' . _DB_PREFIX_ . 'syncrosevi_child_shops` cs ON cs.id_child_shop = t.id_child_shop
+                 WHERE t.id_mother_order = ' . (int) $history->id_order . ' AND t.is_clone = 1 AND t.processed = 1
+                 AND cs.sync_mode = "clone" AND cs.active = 1'
+            );
+            if (!$row || !self::syncOut($row)) {
+                return;
             }
+            $this->loadClone();
+            $clone = new SyncroSeviClone($this, $row, null);
+            $target = $clone->mappedStateOut((int) $history->id_order_state);
+            if (!$target || $target === (int) $row['child_state']) {
+                return;
+            }
+            $webservice = new SyncroSeviWebservice($row['url'], $row['api_key'], $this->isDebug());
+            $webservice->timeout = 15;
+            $webservice->addOrderHistory((int) $row['id_original_order'], $target, !empty($row['clone_state_email']));
+            Db::getInstance()->update(
+                'syncrosevi_order_tracking',
+                array('child_state' => (int) $target),
+                'id_child_shop = ' . (int) $row['id_child_shop'] . ' AND id_original_order = ' . (int) $row['id_original_order']
+            );
+            $this->log('→ Pedido #' . (int) $row['id_original_order'] . ' de ' . $row['name'] . ' cambiado a estado ' . $target . ' (desde el pedido #' . (int) $history->id_order . ' de la madre)');
         } catch (Exception $e) {
-            die(json_encode(array('error' => $e->getMessage())));
+            $this->log('✗ No se pudo cambiar el estado en la tienda hija del pedido #' . (int) $history->id_order . ': ' . $e->getMessage() . ' (¿la clave tiene permiso POST en «order_histories»?)');
         }
     }
 
-    protected function displayConfigurationForm()
+    private function loadClone()
     {
-        $shops = $this->getConfiguredShops();
-        $stats = $this->getStats();
-        $pendingOrders = $this->getPendingOrders();
-        
-        // CORREGIDO: Token mensual
-        $webhook_token = md5('syncrosevi_' . Configuration::get('PS_SHOP_NAME') . '_' . Configuration::get('PS_SHOP_EMAIL') . '_' . date('Y-m'));
-        $base_url = (Configuration::get('PS_SSL_ENABLED') ? 'https://' : 'http://') . $_SERVER['HTTP_HOST'] . __PS_BASE_URI__;
-        $webhook_sync_url = $base_url . 'modules/syncrosevi/webhook.php?action=sync&security_token=' . $webhook_token;
-        $webhook_process_url = $base_url . 'modules/syncrosevi/webhook.php?action=process&security_token=' . $webhook_token;
-        
-        $html = '';
-        
-        // CSS y JavaScript CORREGIDO
-        $html .= '<style>
-        .syncrosevi-panel { margin-bottom: 20px; }
-        .customer-search { position: relative; }
-        .customer-results { position: absolute; top: 100%; left: 0; right: 0; background: white; border: 1px solid #ddd; max-height: 200px; overflow-y: auto; z-index: 1000; display: none; }
-        .customer-item { padding: 10px; cursor: pointer; border-bottom: 1px solid #eee; }
-        .customer-item:hover { background: #f5f5f5; }
-        .transport-options { display: none; margin-top: 10px; }
-        .shop-row:hover { background-color: #f9f9f9; }
-        .btn-group .btn { margin-right: 2px; }
-        .badge-success { background-color: #5cb85c; }
-        .badge-danger { background-color: #d9534f; }
-        .webhook-url { background: #f5f5f5; padding: 10px; font-family: monospace; border: 1px solid #ddd; word-break: break-all; }
-        </style>';
-        
-        // JavaScript CORREGIDO
-        $html .= '<script>
-        var customers_cache = ' . json_encode(Customer::getCustomers(true)) . ';
-        var addresses_all = ' . json_encode($this->getAllAddresses()) . ';
-        var adminLink = "' . $this->context->link->getAdminLink('AdminModules') . '&configure=syncrosevi";
-        
-        function searchCustomers(query, resultId, customerId) {
-            if (query.length < 2) {
-                document.getElementById(resultId).style.display = "none";
-                return;
-            }
-            
-            var filtered = customers_cache.filter(function(c) {
-                return (c.firstname + " " + c.lastname + " " + c.email).toLowerCase().indexOf(query.toLowerCase()) !== -1;
-            });
-            
-            showCustomerResults(filtered.slice(0, 10), resultId, customerId);
+        $this->loadWebservice();
+        if (!class_exists('SyncroSeviClone')) {
+            require_once dirname(__FILE__) . '/classes/SyncroSeviClone.php';
         }
-        
-        function showCustomerResults(customers, resultId, customerId) {
-            var resultsDiv = document.getElementById(resultId);
-            resultsDiv.innerHTML = "";
-            
-            customers.forEach(function(customer) {
-                var div = document.createElement("div");
-                div.className = "customer-item";
-                div.innerHTML = "<strong>" + customer.firstname + " " + customer.lastname + "</strong><br><small>" + customer.email + "</small>";
-                div.onclick = function() { selectCustomer(customer, resultId, customerId); };
-                resultsDiv.appendChild(div);
-            });
-            
-            resultsDiv.style.display = customers.length > 0 ? "block" : "none";
-        }
-        
-        function selectCustomer(customer, resultId, customerId) {
-            var searchField = document.getElementById(resultId.replace("-results", "-search"));
-            searchField.value = customer.firstname + " " + customer.lastname;
-            document.getElementById(customerId).value = customer.id_customer;
-            document.getElementById(resultId).style.display = "none";
-            loadCustomerAddresses(customer.id_customer, resultId.replace("customer-results", "id_address"));
-        }
-        
-        function loadCustomerAddresses(customerId, addressSelectId) {
-            var customerAddresses = addresses_all.filter(function(addr) {
-                return addr.id_customer == customerId;
-            });
-            populateAddresses(customerAddresses, addressSelectId);
-        }
-        
-        function populateAddresses(addresses, selectId) {
-            var select = document.getElementById(selectId);
-            select.innerHTML = "<option value=\"\">Seleccionar dirección...</option>";
-            
-            addresses.forEach(function(address) {
-                var option = document.createElement("option");
-                option.value = address.id_address;
-                option.textContent = address.alias + " - " + address.address1 + ", " + address.city + " (" + address.postcode + ")";
-                select.appendChild(option);
-            });
-            
-            if (addresses.length === 0) {
-                select.innerHTML = "<option value=\"\">Este cliente no tiene direcciones</option>";
-            }
-        }
-        
-        function toggleTransport(show, containerId) {
-            var container = document.getElementById(containerId || "transport-options");
-            container.style.display = show ? "block" : "none";
-            if (!show && container.querySelector("select")) {
-                container.querySelector("select").value = "";
-            }
-        }
-        
-        function editShop(shopId) {
-            window.location.href = adminLink + "&action=edit&id_shop=" + shopId;
-        }
-        
-        function deleteShop(shopId) {
-            if (confirm("¿Estás seguro de eliminar esta tienda? Esta acción no se puede deshacer.")) {
-                window.location.href = adminLink + "&action=delete&id_shop=" + shopId;
-            }
-        }
-        
-        function testConnection(shopId) {
-            var btn = event.target.closest("button");
-            var originalHtml = btn.innerHTML;
-            btn.innerHTML = "<i class=\"icon-spinner icon-spin\"></i>";
-            btn.disabled = true;
-            
-            var xhr = new XMLHttpRequest();
-            xhr.open("GET", adminLink + "&action=test&id_shop=" + shopId, true);
-            xhr.onreadystatechange = function() {
-                if (xhr.readyState === 4) {
-                    btn.innerHTML = originalHtml;
-                    btn.disabled = false;
-                    
-                    if (xhr.status === 200) {
-                        try {
-                            var response = JSON.parse(xhr.responseText);
-                            if (response.success) {
-                                alert("✓ Conexión exitosa\\n\\nInfo: " + (response.shop_info.name || "Tienda conectada"));
-                            } else {
-                                alert("✗ Error de conexión\\n\\n" + response.message);
-                            }
-                        } catch(e) {
-                            alert("Error al procesar respuesta");
-                        }
-                    } else {
-                        alert("Error de comunicación");
-                    }
-                }
-            };
-            xhr.send();
-        }
-
-        // CORREGIDO: Función para cargar estados
-        function loadStatesFromShop() {
-            var url = document.getElementById("shop_url").value;
-            var apiKey = document.getElementById("api_key").value;
-            
-            if (!url || !apiKey) {
-                alert("Completa primero URL y API Key");
-                return;
-            }
-            
-            var btn = document.getElementById("load-states-btn");
-            btn.innerHTML = "<i class=\"icon-spinner icon-spin\"></i> Cargando...";
-            btn.disabled = true;
-            
-            var xhr = new XMLHttpRequest();
-            xhr.open("GET", adminLink + "&action=get_states&shop_url=" + encodeURIComponent(url) + "&api_key=" + encodeURIComponent(apiKey), true);
-            xhr.onreadystatechange = function() {
-                if (xhr.readyState === 4) {
-                    btn.innerHTML = "Cargar Estados de la Tienda Hija";
-                    btn.disabled = false;
-                    
-                    if (xhr.status === 200) {
-                        try {
-                            var response = JSON.parse(xhr.responseText);
-                            if (response.success) {
-                                var container = document.getElementById("import-states-container");
-                                container.innerHTML = "";
-                                
-                                response.states.forEach(function(state) {
-    var div = document.createElement("div");
-    div.className = "checkbox";
-    div.innerHTML = "<label><input type=\"checkbox\" name=\"import_states[]\" value=\"" + state.id + "\"> ID " + state.id + ": " + state.name + "</label>";
-    container.appendChild(div);
-});
-                                
-                                container.style.display = "block";
-                            } else {
-                                alert("Error cargando estados: " + (response.message || "Error desconocido"));
-                            }
-                        } catch(e) {
-                            alert("Error procesando respuesta de estados");
-                        }
-                    } else {
-                        alert("Error de comunicación cargando estados");
-                    }
-                }
-            };
-            xhr.send();
-        }
-        
-        // Ocultar resultados al hacer clic fuera
-        document.addEventListener("click", function(e) {
-            if (!e.target.closest(".customer-search")) {
-                var resultsDiv = document.querySelectorAll(".customer-results");
-                resultsDiv.forEach(function(div) {
-                    div.style.display = "none";
-                });
-            }
-        });
-        </script>';
-        
-        // Resto del HTML sigue siendo el mismo que tenías...
-        $html .= $this->buildConfigurationHTML($stats, $webhook_sync_url, $webhook_process_url, $pendingOrders, $shops);
-        
-        return $html;
     }
 
-    private function buildConfigurationHTML($stats, $webhook_sync_url, $webhook_process_url, $pendingOrders, $shops)
+    /** Recalcula si hay alguna tienda en modo clonar (el bloqueo de correos solo trabaja si la hay) */
+    public static function refreshCloneFlag()
     {
-        $html = '';
-        
-        // Estadísticas
-        $html .= '<div class="panel syncrosevi-panel"><div class="panel-heading"><i class="icon-bar-chart"></i> Estadísticas de Sincronización</div><div class="panel-body">';
-        $html .= '<div class="row">';
-        $html .= '<div class="col-lg-3"><div class="alert alert-info text-center"><h3>' . $stats['total_shops'] . '</h3>Tiendas Configuradas</div></div>';
-        $html .= '<div class="col-lg-3"><div class="alert alert-success text-center"><h3>' . $stats['active_shops'] . '</h3>Tiendas Activas</div></div>';
-        $html .= '<div class="col-lg-3"><div class="alert alert-warning text-center"><h3>' . $stats['pending_orders'] . '</h3>Pedidos Pendientes</div></div>';
-        $html .= '<div class="col-lg-3"><div class="alert alert-info text-center"><h3>' . $stats['processed_orders'] . '</h3>Pedidos Procesados</div></div>';
-        $html .= '</div></div></div>';
-        
-        // URLs para cron CORREGIDAS
-        $html .= '<div class="panel syncrosevi-panel"><div class="panel-heading"><i class="icon-link"></i> URLs para Cron/Webhook</div><div class="panel-body">';
-        $html .= '<div class="alert alert-info">';
-        $html .= '<h4>Configuración de Cron SEPARADOS (recomendado)</h4>';
-        $html .= '<p><strong>Para SOLO sincronizar pedidos (cada 15 min):</strong><br>';
-        $html .= '<code>*/15 * * * * curl -s "' . $webhook_sync_url . '"</code></p>';
-        $html .= '<p><strong>Para SOLO procesar pedidos (cada hora):</strong><br>';
-        $html .= '<code>0 * * * * curl -s "' . $webhook_process_url . '"</code></p>';
-        $html .= '<p><small><strong>Nota:</strong> La sincronización también es automática cuando cambia el estado de un pedido en las tiendas hijas.</small></p>';
-        $html .= '</div>';
-        $html .= '</div></div>';
-        
-        // Resto del HTML del formulario...
-        $html .= $this->getShopConfigurationForm($shops, $pendingOrders);
-        
-        return $html;
+        $n = (int) Db::getInstance()->getValue('SELECT COUNT(*) FROM `' . _DB_PREFIX_ . 'syncrosevi_child_shops` WHERE sync_mode = "clone"');
+        Configuration::updateGlobalValue('SYNCROSEVI_CLONE_ACTIVE', $n ? 1 : 0);
     }
 
-    // CORREGIDO: Cargar estados de tienda hija
-protected function getChildShopStates()
-{
-    $url = Tools::getValue('shop_url');
-    $api_key = Tools::getValue('api_key');
-    
-    if (empty($url) || empty($api_key)) {
-        header('Content-Type: application/json');
-        die(json_encode(array('success' => false, 'message' => 'URL y API Key requeridos')));
-    }
-
-    try {
-        if (!class_exists('SyncroSeviWebservice')) {
-            require_once(dirname(__FILE__).'/classes/SyncroSeviWebservice.php');
-        }
-        
-        $webservice = new SyncroSeviWebservice($url, $api_key, true);
-        $xml = $webservice->get(array('resource' => 'order_states', 'display' => 'full'));
-        
-        $states = array();
-        if ($xml && isset($xml->order_states)) {
-            $orderStates = $xml->order_states->order_state;
-            if (!is_array($orderStates) && !($orderStates instanceof Traversable)) {
-                $orderStates = array($orderStates);
+    /** Abre o cierra la ventana en la que no sale ningún correo a clientes */
+    public static function mailWindow($open)
+    {
+        if ($open) {
+            if (++self::$mailWindow === 1 && version_compare(_PS_VERSION_, '1.7.7.0', '<')) {
+                // Versiones antiguas: además se desactiva el envío solo en este proceso (no se guarda en la base de datos)
+                self::$mailMethodBackup = Configuration::get('PS_MAIL_METHOD');
+                Configuration::set('PS_MAIL_METHOD', 3);
             }
-            
-            foreach ($orderStates as $state) {
-                $stateName = '';
-                if (isset($state->name)) {
-                    if (is_array($state->name) || $state->name instanceof Traversable) {
-                        $stateName = (string)$state->name[0];
-                    } else {
-                        $stateName = (string)$state->name;
-                    }
-                }
-                
-                $states[] = array(
-                    'id' => (int)$state->id,
-                    'name' => $stateName ?: 'Estado #' . (int)$state->id
+        } elseif (self::$mailWindow > 0 && --self::$mailWindow === 0 && self::$mailMethodBackup !== null) {
+            Configuration::set('PS_MAIL_METHOD', self::$mailMethodBackup);
+            self::$mailMethodBackup = null;
+        }
+    }
+
+    /**
+     * Procesa los pedidos pendientes de una tienda en modo clonar: un pedido de la madre por cada pedido de la hija.
+     * Los retenidos (falta un producto, error...) siguen pendientes con el motivo guardado y van al final de la cola.
+     */
+    private function processCloneOrders($shop, $limit)
+    {
+        $db = Db::getInstance();
+        $idShop = (int) $shop['id_child_shop'];
+        $results = array();
+
+        $ids = (array) $db->executeS(
+            'SELECT DISTINCT ol.id_original_order,
+                    (t.clone_error IS NOT NULL AND t.clone_error <> "") AS held
+             FROM `' . _DB_PREFIX_ . 'syncrosevi_order_lines` ol
+             LEFT JOIN `' . _DB_PREFIX_ . 'syncrosevi_order_tracking` t
+                ON (t.id_child_shop = ol.id_child_shop AND t.id_original_order = ol.id_original_order)
+             WHERE ol.id_child_shop = ' . $idShop . ' AND ol.processed = 0
+             ORDER BY held ASC, ol.id_original_order ASC
+             LIMIT ' . (int) $limit
+        );
+        if (!$ids) {
+            return $results;
+        }
+
+        $this->loadClone();
+        $webservice = new SyncroSeviWebservice($shop['url'], $shop['api_key'], $this->isDebug());
+        $clone = new SyncroSeviClone($this, $shop, $webservice);
+
+        $context = Context::getContext();
+        $backup = array($context->cart, $context->customer, $context->currency);
+        foreach ($ids as $row) {
+            $childId = (int) $row['id_original_order'];
+            $db->execute('START TRANSACTION');
+            self::mailWindow(true);
+            ++self::$noPush;
+            try {
+                $created = $clone->cloneOrder($childId);
+                $this->markCloneProcessed($idShop, $childId, $created['id_order'], $created['child_state']);
+                $db->execute('COMMIT');
+                $this->log('✓ Pedido #' . $childId . ' de ' . $shop['name'] . ' clonado como pedido #' . $created['id_order']);
+                $results[] = array(
+                    'shop' => $shop['name'],
+                    'order_id' => $created['id_order'],
+                    'products_count' => $created['products'],
+                    'orders_count' => 1,
+                    'status' => 'success',
                 );
+            } catch (Exception $e) {
+                $db->execute('ROLLBACK');
+                $results[] = $this->cloneFailed($shop, $childId, $e->getMessage(), $e->getCode() == SyncroSeviClone::ERR_HOLD);
+            } catch (Throwable $e) {
+                $db->execute('ROLLBACK');
+                $results[] = $this->cloneFailed($shop, $childId, $e->getMessage() . ' (' . basename($e->getFile()) . ':' . $e->getLine() . ')', false);
             }
+            self::mailWindow(false);
+            --self::$noPush;
+            list($context->cart, $context->customer, $context->currency) = $backup;
         }
-        
-        header('Content-Type: application/json');
-        die(json_encode(array('success' => true, 'states' => $states)));
-        
-    } catch (Exception $e) {
-        header('Content-Type: application/json');
-        die(json_encode(array('success' => false, 'message' => $e->getMessage())));
-    }
-}
-    // Continúa con el resto de métodos que ya estaban bien...
-    protected function processAddShop()
-    {
-        $name = Tools::getValue('shop_name');
-        $url = Tools::getValue('shop_url');
-        $api_key = Tools::getValue('api_key');
-        $id_customer = (int)Tools::getValue('id_customer');
-        $id_address = (int)Tools::getValue('id_address');
-        $id_group = (int)Tools::getValue('id_group');
-        $use_carrier = (int)Tools::getValue('use_carrier');
-        $id_carrier = $use_carrier ? (int)Tools::getValue('id_carrier') : null;
-        $id_order_state = (int)Tools::getValue('id_order_state');
-        $start_order_id = (int)Tools::getValue('start_order_id') ?: 1;
-        $import_states = Tools::getValue('import_states');
-        $active = Tools::getValue('active') ? 1 : 0;
-        
-        if (empty($name) || empty($url) || empty($api_key) || !$id_customer || !$id_address || !$id_group || !$id_order_state || empty($import_states)) {
-            return $this->displayError($this->l('Todos los campos obligatorios deben ser completados'));
-        }
-        
-        // Convertir array de estados a string
-        $import_states_str = is_array($import_states) ? implode(',', array_map('intval', $import_states)) : $import_states;
-        
-        // Validar URL
-        if (!filter_var($url, FILTER_VALIDATE_URL)) {
-            return $this->displayError($this->l('La URL no es válida'));
-        }
-        
-        // Validar que la dirección pertenece al cliente
-        $address = new Address($id_address);
-        if ($address->id_customer != $id_customer) {
-            return $this->displayError($this->l('La dirección seleccionada no pertenece al cliente'));
-        }
-        
-        $inserted = Db::getInstance()->insert('syncrosevi_child_shops', array(
-            'name' => pSQL($name),
-            'url' => pSQL(rtrim($url, '/')),
-            'api_key' => pSQL($api_key),
-            'id_customer' => $id_customer,
-            'id_group' => $id_group,
-            'id_address' => $id_address,
-            'id_carrier' => $id_carrier,
-            'id_order_state' => $id_order_state,
-            'start_order_id' => $start_order_id,
-            'import_states' => pSQL($import_states_str),
-            'active' => $active,
-            'date_add' => date('Y-m-d H:i:s'),
-            'date_upd' => date('Y-m-d H:i:s')
-        ));
-        
-        if ($inserted) {
-            return $this->displayConfirmation($this->l('Tienda hija añadida correctamente'));
-        } else {
-            return $this->displayError($this->l('Error al añadir la tienda hija'));
-        }
+
+        return $results;
     }
 
-    // Resto de métodos que continúan igual...
-    protected function getStats()
+    private function cloneFailed($shop, $childId, $message, $held)
     {
-        $totalShops = (int)Db::getInstance()->getValue(
-            'SELECT COUNT(*) FROM `' . _DB_PREFIX_ . 'syncrosevi_child_shops`'
+        Db::getInstance()->update(
+            'syncrosevi_order_tracking',
+            array('clone_error' => pSQL(Tools::substr(($held ? 'Retenido: ' : 'Error: ') . $message, 0, 2000))),
+            'id_child_shop = ' . (int) $shop['id_child_shop'] . ' AND id_original_order = ' . (int) $childId
         );
-        
-        $activeShops = (int)Db::getInstance()->getValue(
-            'SELECT COUNT(*) FROM `' . _DB_PREFIX_ . 'syncrosevi_child_shops` WHERE active = 1'
-        );
-        
-        $pendingOrders = (int)Db::getInstance()->getValue(
-            'SELECT COUNT(DISTINCT id_child_shop, id_original_order) FROM `' . _DB_PREFIX_ . 'syncrosevi_order_lines` WHERE processed = 0'
-        );
-        
-        $processedOrders = (int)Db::getInstance()->getValue(
-            'SELECT COUNT(*) FROM `' . _DB_PREFIX_ . 'syncrosevi_order_tracking` WHERE processed = 1'
-        );
+        $this->log(($held ? '⏸ Pedido #' : '✗ Pedido #') . $childId . ' de ' . $shop['name'] . ' sin clonar (sigue pendiente): ' . $message);
 
         return array(
-            'total_shops' => $totalShops,
-            'active_shops' => $activeShops,
-            'pending_orders' => $pendingOrders,
-            'processed_orders' => $processedOrders
-        );
-    }
-    
-    protected function getAllAddresses()
-    {
-        return Db::getInstance()->executeS(
-            'SELECT a.id_address, a.id_customer, a.alias, a.firstname, a.lastname, a.address1, a.city, a.postcode
-             FROM `' . _DB_PREFIX_ . 'address` a
-             WHERE a.deleted = 0
-             ORDER BY a.id_customer, a.alias ASC'
+            'shop' => $shop['name'],
+            'status' => 'error',
+            'message' => 'Pedido #' . $childId . ($held ? ' retenido: ' : ': ') . $message . ' (sigue pendiente)',
         );
     }
 
-
-
-    protected function getConfiguredShops()
+    private function markCloneProcessed($idShop, $childId, $motherId, $childState)
     {
-        return Db::getInstance()->executeS(
-            'SELECT cs.*, c.firstname, c.lastname, c.email, 
-                    a.alias as address_alias, a.address1, a.city,
-                    g.name as group_name, os.name as state_name, ca.name as carrier_name
-             FROM `' . _DB_PREFIX_ . 'syncrosevi_child_shops` cs
-             LEFT JOIN `' . _DB_PREFIX_ . 'customer` c ON cs.id_customer = c.id_customer
-             LEFT JOIN `' . _DB_PREFIX_ . 'address` a ON cs.id_address = a.id_address
-             LEFT JOIN `' . _DB_PREFIX_ . 'group_lang` g ON cs.id_group = g.id_group AND g.id_lang = ' . (int)$this->context->language->id . '
-             LEFT JOIN `' . _DB_PREFIX_ . 'order_state_lang` os ON cs.id_order_state = os.id_order_state AND os.id_lang = ' . (int)$this->context->language->id . '
-             LEFT JOIN `' . _DB_PREFIX_ . 'carrier` ca ON cs.id_carrier = ca.id_carrier
-             ORDER BY cs.name ASC'
+        $db = Db::getInstance();
+        $db->execute(
+            'UPDATE `' . _DB_PREFIX_ . 'syncrosevi_order_lines` SET processed = 1
+             WHERE id_child_shop = ' . (int) $idShop . ' AND id_original_order = ' . (int) $childId . ' AND processed = 0'
         );
-    }
-    
-    protected function getPendingOrders()
-    {
-        return Db::getInstance()->executeS(
-            'SELECT cs.name as shop_name, cs.id_child_shop,
-                   ol.id_original_order, ol.product_name, ol.product_reference, 
-                   SUM(ol.quantity) as total_quantity,
-                   COUNT(ol.id_line) as lines_count,
-                   MIN(ol.date_add) as first_sync
-            FROM `' . _DB_PREFIX_ . 'syncrosevi_order_lines` ol
-            JOIN `' . _DB_PREFIX_ . 'syncrosevi_child_shops` cs ON ol.id_child_shop = cs.id_child_shop
-            WHERE ol.processed = 0
-            GROUP BY cs.id_child_shop, ol.id_original_order
-            ORDER BY ol.date_add DESC
-            LIMIT 10'
+        $db->execute(
+            'UPDATE `' . _DB_PREFIX_ . 'syncrosevi_order_tracking`
+             SET id_mother_order = ' . (int) $motherId . ', processed = 1, is_clone = 1,
+                 child_state = ' . (int) $childState . ', clone_error = NULL,
+                 date_processed = "' . date('Y-m-d H:i:s') . '"
+             WHERE id_child_shop = ' . (int) $idShop . ' AND id_original_order = ' . (int) $childId
         );
     }
 
-    // Continuar con el resto de métodos para procesar formularios, etc.
-    // (implementar processEditShop, showEditForm, processDeleteShop, processTestConnection, etc.)
-    
-
-
-
-    
-    /**
-     * CORREGIDO: Mostrar formulario de edición funcional
-     */
-    protected function showEditForm()
+    /** Pide a la hija el estado actual de los pedidos clonados (últimos 120 días) y aplica los cambios */
+    private function syncCloneStates($shop, $webservice)
     {
-        $id_shop = (int)Tools::getValue('id_shop');
-        
-        if (!$id_shop) {
-            return $this->displayError($this->l('ID de tienda inválido'));
-        }
-
-        $shop = Db::getInstance()->getRow(
-            'SELECT * FROM `' . _DB_PREFIX_ . 'syncrosevi_child_shops` WHERE id_child_shop = ' . $id_shop
+        $rows = (array) Db::getInstance()->executeS(
+            'SELECT id_original_order, id_mother_order, child_state FROM `' . _DB_PREFIX_ . 'syncrosevi_order_tracking`
+             WHERE id_child_shop = ' . (int) $shop['id_child_shop'] . ' AND processed = 1 AND is_clone = 1
+             AND id_mother_order > 0 AND date_processed > "' . date('Y-m-d H:i:s', time() - 120 * 86400) . '"
+             ORDER BY id_original_order DESC LIMIT 2000'
         );
-
-        if (!$shop) {
-            return $this->displayError($this->l('Tienda no encontrada'));
+        if (!$rows) {
+            return;
         }
-
-        $customer = new Customer($shop['id_customer']);
-        $import_states_array = explode(',', $shop['import_states']);
-
-        $html = '<div class="panel"><div class="panel-heading"><i class="icon-edit"></i> Editar Tienda Hija: ' . $shop['name'];
-        $html .= ' <a href="' . $this->context->link->getAdminLink('AdminModules') . '&configure=syncrosevi" class="btn btn-default btn-sm pull-right">Volver</a>';
-        $html .= '</div><div class="panel-body">';
-        
-        // JavaScript para formulario de edición
-        $html .= '<script>
-        var customers_cache = ' . json_encode(Customer::getCustomers(true)) . ';
-        var addresses_all = ' . json_encode($this->getAllAddresses()) . ';
-        var adminLink = "' . $this->context->link->getAdminLink('AdminModules') . '&configure=syncrosevi";
-        
-        function searchCustomersEdit(query) {
-            searchCustomers(query, "edit-customer-results", "edit-selected-customer-id");
-        }
-        
-        function loadStatesFromShopEdit() {
-            var url = document.getElementById("edit_shop_url").value;
-            var apiKey = document.getElementById("edit_api_key").value;
-            loadStatesFromShopGeneric(url, apiKey, "edit-import-states-container");
-        }
-        
-        function loadStatesFromShopGeneric(url, apiKey, containerId) {
-            if (!url || !apiKey) {
-                alert("Completa primero URL y API Key");
-                return;
+        $states = $webservice->getOrderStates(array_column($rows, 'id_original_order'));
+        foreach ($rows as $row) {
+            $id = (int) $row['id_original_order'];
+            if (isset($states[$id]) && $states[$id]['state'] && $states[$id]['state'] !== (int) $row['child_state']) {
+                $this->applyCloneState($shop, $id, (int) $row['id_mother_order'], $states[$id]['state'], $states[$id]['tracking']);
             }
-            
-            var xhr = new XMLHttpRequest();
-            xhr.open("GET", adminLink + "&action=get_states&shop_url=" + encodeURIComponent(url) + "&api_key=" + encodeURIComponent(apiKey), true);
-            xhr.onreadystatechange = function() {
-                if (xhr.readyState === 4 && xhr.status === 200) {
-                    try {
-                        var response = JSON.parse(xhr.responseText);
-                        if (response.success) {
-                            var container = document.getElementById(containerId);
-                            container.innerHTML = "";
-                            
-                           response.states.forEach(function(state) {
-    var div = document.createElement("div");
-    div.className = "checkbox";
-    var checked = ' . json_encode($import_states_array) . '.indexOf(state.id.toString()) !== -1 ? "checked" : "";
-    div.innerHTML = "<label><input type=\"checkbox\" name=\"import_states[]\" value=\"" + state.id + "\" " + checked + "> ID " + state.id + ": " + state.name + "</label>";
-    container.appendChild(div);
-});
-                            
-                            container.style.display = "block";
-                        }
-                    } catch(e) {
-                        alert("Error procesando respuesta");
-                    }
+        }
+    }
+
+    /** Aplica un estado de la hija a su pedido clonado (sin correos) y lo apunta */
+    private function applyCloneState($shop, $childId, $motherId, $childState, $tracking = '')
+    {
+        $this->loadClone();
+        Db::getInstance()->update(
+            'syncrosevi_order_tracking',
+            array('child_state' => (int) $childState),
+            'id_child_shop = ' . (int) $shop['id_child_shop'] . ' AND id_original_order = ' . (int) $childId
+        );
+        if (!self::syncIn($shop)) {
+            return false;
+        }
+        self::mailWindow(true);
+        ++self::$noPush;
+        try {
+            $clone = new SyncroSeviClone($this, $shop, null);
+            $changed = $clone->applyState($motherId, $childState, (string) $tracking);
+        } catch (Exception $e) {
+            $this->log('✗ No se pudo cambiar el estado del pedido clonado #' . (int) $motherId . ': ' . $e->getMessage());
+            $changed = false;
+        }
+        self::mailWindow(false);
+        --self::$noPush;
+
+        return $changed;
+    }
+
+    /**
+     * ======================================================================
+     * CORREOS: ninguno al cliente por los pedidos clonados
+     * ======================================================================
+     */
+    public function hookActionEmailSendBefore($params)
+    {
+        try {
+            if (!self::$mailWindow && !(int) Configuration::getGlobalValue('SYNCROSEVI_CLONE_ACTIVE')) {
+                return true;
+            }
+            $to = isset($params['to']) ? $params['to'] : '';
+            $recipients = array();
+            foreach ((array) $to as $k => $v) {
+                $email = Validate::isEmail($k) ? $k : $v;
+                if (is_string($email) && trim($email) !== '') {
+                    $recipients[] = Tools::strtolower(trim($email));
                 }
-            };
-            xhr.send();
-        }
-        </script>';
-        
-        $html .= '<form method="post" class="form-horizontal">';
-        $html .= '<input type="hidden" name="id_child_shop" value="' . $shop['id_child_shop'] . '">';
-        
-        // Campos del formulario con valores prellenados
-        $html .= '<div class="row">';
-        $html .= '<div class="col-md-6">';
-        $html .= '<div class="form-group">';
-        $html .= '<label class="control-label">Nombre de la Tienda *</label>';
-        $html .= '<input type="text" name="shop_name" class="form-control" value="' . htmlspecialchars($shop['name']) . '" required>';
-        $html .= '</div>';
-        $html .= '<div class="form-group">';
-        $html .= '<label class="control-label">URL de la Tienda *</label>';
-        $html .= '<input type="url" name="shop_url" id="edit_shop_url" class="form-control" value="' . htmlspecialchars($shop['url']) . '" required>';
-        $html .= '</div>';
-        $html .= '<div class="form-group">';
-        $html .= '<label class="control-label">Clave API WebService *</label>';
-        $html .= '<input type="text" name="api_key" id="edit_api_key" class="form-control" value="' . htmlspecialchars($shop['api_key']) . '" required>';
-        $html .= '</div>';
-        $html .= '</div>';
-        
-        $html .= '<div class="col-md-6">';
-        // Cliente con buscador
-        $html .= '<div class="form-group">';
-        $html .= '<label class="control-label">Cliente Asignado *</label>';
-        $html .= '<div class="customer-search">';
-        $html .= '<input type="text" id="edit-customer-search" class="form-control" value="' . $customer->firstname . ' ' . $customer->lastname . '" onkeyup="searchCustomersEdit(this.value)" autocomplete="off">';
-        $html .= '<input type="hidden" id="edit-selected-customer-id" name="id_customer" value="' . $shop['id_customer'] . '" required>';
-        $html .= '<div id="edit-customer-results" class="customer-results"></div>';
-        $html .= '</div>';
-        $html .= '</div>';
-        
-        // Dirección
-        $html .= '<div class="form-group">';
-        $html .= '<label class="control-label">Dirección de Facturación *</label>';
-        $html .= '<select name="id_address" id="edit_id_address" class="form-control" required>';
-        $addresses = Db::getInstance()->executeS('SELECT * FROM `' . _DB_PREFIX_ . 'address` WHERE id_customer = ' . (int)$shop['id_customer'] . ' AND deleted = 0');
-        foreach ($addresses as $addr) {
-            $selected = ($addr['id_address'] == $shop['id_address']) ? 'selected' : '';
-            $html .= '<option value="' . $addr['id_address'] . '" ' . $selected . '>' . $addr['alias'] . ' - ' . $addr['address1'] . '</option>';
-        }
-        $html .= '</select>';
-        $html .= '</div>';
-        
-        // Grupo
-        $html .= '<div class="form-group">';
-        $html .= '<label class="control-label">Grupo de Precios *</label>';
-        $html .= '<select name="id_group" class="form-control" required>';
-        foreach (Group::getGroups($this->context->language->id) as $group) {
-            $selected = ($group['id_group'] == $shop['id_group']) ? 'selected' : '';
-            $html .= '<option value="' . $group['id_group'] . '" ' . $selected . '>' . $group['name'] . '</option>';
-        }
-        $html .= '</select>';
-        $html .= '</div>';
-        $html .= '</div>';
-        $html .= '</div>';
-        
-        // Resto de campos...
-        $html .= '<div class="row">';
-        $html .= '<div class="col-md-6">';
-        
-        // Transporte
-        $useCarrier = !empty($shop['id_carrier']);
-        $html .= '<div class="form-group">';
-        $html .= '<label class="control-label">¿Usar Transportista Específico?</label>';
-        $html .= '<div>';
-        $html .= '<label class="radio-inline"><input type="radio" name="use_carrier" value="0"' . (!$useCarrier ? ' checked' : '') . ' onclick="toggleTransport(false, \'edit-transport-options\')"> No</label>';
-        $html .= '<label class="radio-inline"><input type="radio" name="use_carrier" value="1"' . ($useCarrier ? ' checked' : '') . ' onclick="toggleTransport(true, \'edit-transport-options\')"> Sí</label>';
-        $html .= '</div>';
-        $style = $useCarrier ? 'display: block;' : 'display: none;';
-        $html .= '<div id="edit-transport-options" class="transport-options" style="' . $style . ' margin-top: 10px;">';
-        $html .= '<select name="id_carrier" class="form-control">';
-        $html .= '<option value="">Seleccionar transportista...</option>';
-        foreach (Carrier::getCarriers($this->context->language->id, true) as $carrier) {
-            $selected = ($carrier['id_carrier'] == $shop['id_carrier']) ? 'selected' : '';
-            $html .= '<option value="' . $carrier['id_carrier'] . '" ' . $selected . '>' . $carrier['name'] . '</option>';
-        }
-        $html .= '</select>';
-        $html .= '</div>';
-        $html .= '</div>';
-        
-        // ID de pedido inicial
-        $html .= '<div class="form-group">';
-        $html .= '<label class="control-label">Importar desde el pedido ID *</label>';
-        $html .= '<input type="number" name="start_order_id" class="form-control" value="' . $shop['start_order_id'] . '" min="1" required>';
-        $html .= '</div>';
-        $html .= '</div>';
-        
-        $html .= '<div class="col-md-6">';
-        // Estado
-        $html .= '<div class="form-group">';
-        $html .= '<label class="control-label">Estado del Pedido *</label>';
-        $html .= '<select name="id_order_state" class="form-control" required>';
-        foreach (OrderState::getOrderStates($this->context->language->id) as $state) {
-            $selected = ($state['id_order_state'] == $shop['id_order_state']) ? 'selected' : '';
-            $html .= '<option value="' . $state['id_order_state'] . '" ' . $selected . '>' . $state['name'] . '</option>';
-        }
-        $html .= '</select>';
-        $html .= '</div>';
-        
-        // Activo
-        $html .= '<div class="form-group">';
-        $html .= '<div class="checkbox">';
-        $checked = $shop['active'] ? 'checked' : '';
-        $html .= '<label><input type="checkbox" name="active" value="1" ' . $checked . '> Tienda activa</label>';
-        $html .= '</div>';
-        $html .= '</div>';
-        $html .= '</div>';
-        $html .= '</div>';
-        
-        // Estados a importar
-        $html .= '<div class="form-group">';
-        $html .= '<label class="control-label">Estados de pedidos a importar *</label>';
-        $html .= '<button type="button" class="btn btn-info btn-sm" onclick="loadStatesFromShopEdit()">Recargar Estados de la Tienda</button>';
-        $html .= '<div id="edit-import-states-container" class="import-states-container" style="display: block;">';
-        foreach (OrderState::getOrderStates($this->context->language->id) as $state) {
-            $checked = in_array($state['id_order_state'], $import_states_array) ? 'checked' : '';
-            $html .= '<div class="checkbox">';
-            $html .= '<label><input type="checkbox" name="import_states[]" value="' . $state['id_order_state'] . '" ' . $checked . '> ' . $state['name'] . '</label>';
-            $html .= '</div>';
-        }
-        $html .= '</div>';
-        $html .= '</div>';
-        
-        $html .= '<div class="form-group">';
-        $html .= '<button type="submit" name="submitEditShop" class="btn btn-success btn-lg"><i class="icon-save"></i> Guardar Cambios</button>';
-        $html .= ' <a href="' . $this->context->link->getAdminLink('AdminModules') . '&configure=syncrosevi" class="btn btn-default">Cancelar</a>';
-        $html .= '</div>';
-        $html .= '</form>';
-        $html .= '</div></div>';
-        
-        return $html;
-    }
-
-/**
-     * CORREGIDO: Procesar eliminación de tienda COMPLETA
-     */
-    protected function processDeleteShop()
-    {
-        $id_shop = (int)Tools::getValue('id_shop');
-        
-        if (!$id_shop) {
-            return $this->displayError($this->l('ID de tienda inválido'));
-        }
-        
-        // Verificar que no tenga pedidos pendientes
-        $pendingCount = (int)Db::getInstance()->getValue(
-            'SELECT COUNT(*) FROM `' . _DB_PREFIX_ . 'syncrosevi_order_lines` 
-             WHERE id_child_shop = ' . $id_shop . ' AND processed = 0'
-        );
-        
-        if ($pendingCount > 0) {
-            return $this->displayError($this->l('No se puede eliminar la tienda porque tiene ') . $pendingCount . $this->l(' pedidos pendientes de procesamiento. Procesa los pedidos primero.'));
-        }
-        
-        // También eliminar tracking relacionado
-        Db::getInstance()->delete('syncrosevi_order_tracking', 'id_child_shop = ' . $id_shop);
-        Db::getInstance()->delete('syncrosevi_order_lines', 'id_child_shop = ' . $id_shop . ' AND processed = 1');
-        
-        // Eliminar la tienda
-        $deleted = Db::getInstance()->delete('syncrosevi_child_shops', 'id_child_shop = ' . $id_shop);
-        
-        if ($deleted) {
-            return $this->displayConfirmation($this->l('Tienda hija eliminada correctamente'));
-        } else {
-            return $this->displayError($this->l('Error al eliminar la tienda hija'));
-        }
-    }
-		
-		
-		
-		/**
-     * CORREGIDO: Formulario de configuración de tiendas completo
-     */
-    protected function getShopConfigurationForm($shops, $pendingOrders)
-    {
-        $html = '';
-        
-        // Acciones rápidas
-        $html .= '<div class="panel syncrosevi-panel"><div class="panel-heading"><i class="icon-cogs"></i> Acciones Manuales</div><div class="panel-body">';
-        $html .= '<div class="btn-group" role="group">';
-        $html .= '<form method="post" style="display:inline;">';
-        $html .= '<button type="submit" name="submitSyncOrders" class="btn btn-primary"><i class="icon-refresh"></i> Sincronizar Pedidos</button>';
-        $html .= '</form> ';
-        $html .= '<form method="post" style="display:inline;">';
-        $html .= '<button type="submit" name="submitProcessOrders" class="btn btn-success"><i class="icon-cogs"></i> Procesar Pedidos</button>';
-        $html .= '</form> ';
-        $html .= '<form method="post" style="display:inline;">';
-        $html .= '<button type="submit" name="submitViewPending" class="btn btn-warning"><i class="icon-list"></i> Ver Pedidos Pendientes</button>';
-        $html .= '</form>';
-        $html .= '</div></div></div>';
-        
-        // Pedidos pendientes (vista rápida)
-        if (!empty($pendingOrders)) {
-            $html .= '<div class="panel syncrosevi-panel"><div class="panel-heading"><i class="icon-clock-o"></i> Últimos Pedidos Pendientes <span class="badge">' . count($pendingOrders) . '</span></div><div class="panel-body">';
-            $html .= '<div class="table-responsive"><table class="table table-striped table-condensed">';
-            $html .= '<thead><tr><th>Tienda</th><th>Pedido #</th><th>Productos</th><th>Fecha Sync</th></tr></thead><tbody>';
-            $count = 0;
-            foreach ($pendingOrders as $order) {
-                if ($count >= 5) break;
-                $html .= '<tr>';
-                $html .= '<td><strong>' . $order['shop_name'] . '</strong></td>';
-                $html .= '<td>#' . $order['id_original_order'] . '</td>';
-                $html .= '<td>' . $order['lines_count'] . ' líneas</td>';
-                $html .= '<td>' . date('d/m/Y H:i', strtotime($order['first_sync'])) . '</td>';
-                $html .= '</tr>';
-                $count++;
             }
-            $html .= '</tbody></table></div>';
-            if (count($pendingOrders) > 5) {
-                $html .= '<div class="text-center"><form method="post" style="display:inline;"><button type="submit" name="submitViewPending" class="btn btn-default btn-sm">Ver todos los ' . count($pendingOrders) . ' pedidos pendientes</button></form></div>';
+            $customers = array_values(array_diff($recipients, $this->staffEmails()));
+            if (!$customers) {
+                return true; // solo personal de la tienda (avisos de pedido nuevo, etc.)
             }
-            $html .= '</div></div>';
-        }
-        
-        // Formulario para añadir tienda
-        $html .= '<div class="panel syncrosevi-panel"><div class="panel-heading"><i class="icon-plus"></i> Añadir Nueva Tienda Hija</div><div class="panel-body">';
-        $html .= '<form method="post" class="form-horizontal" id="add-shop-form">';
-        
-        $html .= '<div class="row">';
-        $html .= '<div class="col-md-6">';
-        $html .= '<div class="form-group">';
-        $html .= '<label class="control-label">Nombre de la Tienda *</label>';
-        $html .= '<input type="text" name="shop_name" class="form-control" placeholder="Ej: Tienda Barcelona" required>';
-        $html .= '</div>';
-        $html .= '<div class="form-group">';
-        $html .= '<label class="control-label">URL de la Tienda *</label>';
-        $html .= '<input type="url" name="shop_url" id="shop_url" class="form-control" placeholder="https://tienda-hija.com" required>';
-        $html .= '</div>';
-        $html .= '<div class="form-group">';
-        $html .= '<label class="control-label">Clave API WebService *</label>';
-        $html .= '<input type="text" name="api_key" id="api_key" class="form-control" placeholder="Clave del WebService de la tienda hija" required>';
-        $html .= '<small class="help-block">Generar en: Parámetros Avanzados > WebService</small>';
-        $html .= '</div>';
-        $html .= '</div>';
-        
-        $html .= '<div class="col-md-6">';
-        // Búsqueda de cliente
-        $html .= '<div class="form-group">';
-        $html .= '<label class="control-label">Cliente Asignado *</label>';
-        $html .= '<div class="customer-search">';
-        $html .= '<input type="text" id="customer-search" class="form-control" placeholder="Buscar cliente..." onkeyup="searchCustomers(this.value, \'customer-results\', \'selected-customer-id\')" autocomplete="off">';
-        $html .= '<input type="hidden" id="selected-customer-id" name="id_customer" required>';
-        $html .= '<div id="customer-results" class="customer-results"></div>';
-        $html .= '</div>';
-        $html .= '</div>';
-        
-        // Dirección de facturación
-        $html .= '<div class="form-group">';
-        $html .= '<label class="control-label">Dirección de Facturación *</label>';
-        $html .= '<select name="id_address" id="id_address" class="form-control" required>';
-        $html .= '<option value="">Primero selecciona un cliente</option>';
-        $html .= '</select>';
-        $html .= '</div>';
-        
-        // Grupo de precios
-        $html .= '<div class="form-group">';
-        $html .= '<label class="control-label">Grupo de Precios *</label>';
-        $html .= '<select name="id_group" class="form-control" required>';
-        $html .= '<option value="">Seleccionar grupo...</option>';
-        foreach (Group::getGroups($this->context->language->id) as $group) {
-            $html .= '<option value="' . $group['id_group'] . '">' . $group['name'] . '</option>';
-        }
-        $html .= '</select>';
-        $html .= '</div>';
-        $html .= '</div>';
-        $html .= '</div>';
-        
-        // Configuración adicional
-        $html .= '<div class="row">';
-        $html .= '<div class="col-md-6">';
-        
-        // Transporte
-        $html .= '<div class="form-group">';
-        $html .= '<label class="control-label">¿Usar Transportista Específico?</label>';
-        $html .= '<div>';
-        $html .= '<label class="radio-inline"><input type="radio" name="use_carrier" value="0" onclick="toggleTransport(false)" checked> No</label>';
-        $html .= '<label class="radio-inline"><input type="radio" name="use_carrier" value="1" onclick="toggleTransport(true)"> Sí</label>';
-        $html .= '</div>';
-        $html .= '<div id="transport-options" class="transport-options">';
-        $html .= '<select name="id_carrier" id="id_carrier" class="form-control">';
-        $html .= '<option value="">Seleccionar transportista...</option>';
-        foreach (Carrier::getCarriers($this->context->language->id, true) as $carrier) {
-            $html .= '<option value="' . $carrier['id_carrier'] . '">' . $carrier['name'] . '</option>';
-        }
-        $html .= '</select>';
-        $html .= '</div>';
-        $html .= '</div>';
-        
-        // ID de pedido inicial
-        $html .= '<div class="form-group">';
-        $html .= '<label class="control-label">Importar desde el pedido ID *</label>';
-        $html .= '<input type="number" name="start_order_id" class="form-control" value="1" min="1" required>';
-        $html .= '<small class="help-block">Solo se importarán pedidos con ID igual o mayor a este número</small>';
-        $html .= '</div>';
-        $html .= '</div>';
-        
-        $html .= '<div class="col-md-6">';
-        // Estado del pedido
-        $html .= '<div class="form-group">';
-        $html .= '<label class="control-label">Estado del Pedido *</label>';
-        $html .= '<select name="id_order_state" class="form-control" required>';
-        $html .= '<option value="">Seleccionar estado...</option>';
-        foreach (OrderState::getOrderStates($this->context->language->id) as $state) {
-            $html .= '<option value="' . $state['id_order_state'] . '">' . $state['name'] . '</option>';
-        }
-        $html .= '</select>';
-        $html .= '</div>';
-        
-        // Activo
-        $html .= '<div class="form-group">';
-        $html .= '<div class="checkbox">';
-        $html .= '<label><input type="checkbox" name="active" value="1" checked> Tienda activa</label>';
-        $html .= '</div>';
-        $html .= '</div>';
-        $html .= '</div>';
-        $html .= '</div>';
 
-        // Estados a importar CORREGIDO
-        $html .= '<div class="form-group">';
-        $html .= '<label class="control-label">Estados de pedidos a importar *</label>';
-        $html .= '<div class="alert alert-info"><small>Primero completa URL y API Key, luego haz clic en "Cargar Estados"</small></div>';
-        $html .= '<button type="button" id="load-states-btn" class="btn btn-info btn-sm" onclick="loadStatesFromShop()">Cargar Estados de la Tienda Hija</button>';
-        $html .= '<div id="import-states-container" class="import-states-container">';
-        $html .= '</div>';
-        $html .= '</div>';
-        
-        $html .= '<div class="form-group">';
-        $html .= '<button type="submit" name="submitAddShop" class="btn btn-primary btn-lg"><i class="icon-plus"></i> Añadir Tienda Hija</button>';
-        $html .= '</div>';
-        $html .= '</form>';
-        $html .= '</div></div>';
-        
-        // Lista de tiendas configuradas
-        if ($shops) {
-            $html .= '<div class="panel syncrosevi-panel"><div class="panel-heading"><i class="icon-list"></i> Tiendas Hijas Configuradas</div><div class="panel-body">';
-            $html .= '<div class="table-responsive"><table class="table table-striped">';
-            $html .= '<thead><tr><th>Nombre</th><th>URL</th><th>Cliente</th><th>Dirección</th><th>Transportista</th><th>Estado Pedido</th><th>Activa</th><th>Acciones</th></tr></thead><tbody>';
-            foreach ($shops as $shop) {
-                $html .= '<tr class="shop-row">';
-                $html .= '<td><strong>' . $shop['name'] . '</strong></td>';
-                $html .= '<td><small>' . $shop['url'] . '</small></td>';
-                $html .= '<td>' . $shop['firstname'] . ' ' . $shop['lastname'] . '</td>';
-                $html .= '<td>' . ($shop['address_alias'] ?: 'N/A') . '</td>';
-                $html .= '<td>' . ($shop['carrier_name'] ?: '<em>Sin transportista</em>') . '</td>';
-                $html .= '<td><span class="badge">' . $shop['state_name'] . '</span></td>';
-                $html .= '<td>' . ($shop['active'] ? '<span class="badge badge-success">Sí</span>' : '<span class="badge badge-danger">No</span>') . '</td>';
-                $html .= '<td>';
-                $html .= '<div class="btn-group">';
-                $html .= '<button type="button" class="btn btn-xs btn-info" onclick="testConnection(' . $shop['id_child_shop'] . ')" title="Probar Conexión"><i class="icon-link"></i></button>';
-                $html .= '<button type="button" class="btn btn-xs btn-primary" onclick="editShop(' . $shop['id_child_shop'] . ')" title="Editar"><i class="icon-edit"></i></button>';
-                $html .= '<button type="button" class="btn btn-xs btn-danger" onclick="deleteShop(' . $shop['id_child_shop'] . ')" title="Eliminar"><i class="icon-trash"></i></button>';
-                $html .= '</div>';
-                $html .= '</td>';
-                $html .= '</tr>';
+            $reason = '';
+            $vars = isset($params['templateVars']) && is_array($params['templateVars']) ? $params['templateVars'] : array();
+            if (self::$mailWindow) {
+                $reason = 'se está creando o actualizando un pedido clonado';
+            } elseif ($id = $this->cloneOrderInVars($vars)) {
+                $reason = 'es del pedido clonado #' . $id;
+            } elseif ($this->isCloneOnlyCustomer($customers)) {
+                $reason = 'cliente creado por el clonado';
             }
-            $html .= '</tbody></table></div></div></div>';
+            if ($reason === '') {
+                return true;
+            }
+            $this->log('✉ Correo bloqueado: plantilla «' . (isset($params['template']) ? $params['template'] : '') . '» a ' . implode(', ', $customers) . ' (' . $reason . ')');
+
+            return false;
+        } catch (Exception $e) {
+            return true;
         }
-        
-        return $html;
     }
 
-    /**
-     * CORREGIDO: Procesar edición de tienda
-     */
-    protected function processEditShop()
+    /** Emails del personal: empleados activos, email de la tienda y avisos de pedidos (mailalerts) */
+    private function staffEmails()
     {
-        $id_shop = (int)Tools::getValue('id_child_shop');
-        $name = Tools::getValue('shop_name');
-        $url = Tools::getValue('shop_url');
-        $api_key = Tools::getValue('api_key');
-        $id_customer = (int)Tools::getValue('id_customer');
-        $id_address = (int)Tools::getValue('id_address');
-        $id_group = (int)Tools::getValue('id_group');
-        $use_carrier = (int)Tools::getValue('use_carrier');
-        $id_carrier = $use_carrier ? (int)Tools::getValue('id_carrier') : null;
-        $id_order_state = (int)Tools::getValue('id_order_state');
-        $start_order_id = (int)Tools::getValue('start_order_id') ?: 1;
-        $import_states = Tools::getValue('import_states');
-        $active = Tools::getValue('active') ? 1 : 0;
-
-        if (!$id_shop || empty($name) || empty($url) || empty($api_key) || !$id_customer || !$id_address || !$id_group || !$id_order_state || empty($import_states)) {
-            return $this->displayError($this->l('Todos los campos obligatorios deben ser completados'));
-        }
-
-        // Validar URL
-        if (!filter_var($url, FILTER_VALIDATE_URL)) {
-            return $this->displayError($this->l('La URL no es válida'));
-        }
-
-        // Convertir array de estados a string
-        $import_states_str = is_array($import_states) ? implode(',', array_map('intval', $import_states)) : $import_states;
-
-        $updated = Db::getInstance()->update('syncrosevi_child_shops', array(
-            'name' => pSQL($name),
-            'url' => pSQL(rtrim($url, '/')),
-            'api_key' => pSQL($api_key),
-            'id_customer' => $id_customer,
-            'id_group' => $id_group,
-            'id_address' => $id_address,
-            'id_carrier' => $id_carrier,
-            'id_order_state' => $id_order_state,
-            'start_order_id' => $start_order_id,
-            'import_states' => pSQL($import_states_str),
-            'active' => $active,
-            'date_upd' => date('Y-m-d H:i:s')
-        ), 'id_child_shop = ' . $id_shop);
-
-        if ($updated) {
-            return $this->displayConfirmation($this->l('Tienda hija actualizada correctamente'));
-        } else {
-            return $this->displayError($this->l('Error al actualizar la tienda hija'));
-        }
-    }
-
-   
-    /**
-     * CORREGIDO: Procesar test de conexión
-     */
-protected function processTestConnection()
-{
-    $id_shop = (int)Tools::getValue('id_shop');
-    
-    if (!$id_shop) {
-        header('Content-Type: application/json');
-        die(json_encode(array('success' => false, 'message' => 'ID de tienda inválido')));
-    }
-
-    $shop = Db::getInstance()->getRow(
-        'SELECT * FROM `' . _DB_PREFIX_ . 'syncrosevi_child_shops` WHERE id_child_shop = ' . $id_shop
-    );
-
-    if (!$shop) {
-        header('Content-Type: application/json');
-        die(json_encode(array('success' => false, 'message' => 'Tienda no encontrada')));
-    }
-
-    try {
-        if (!class_exists('SyncroSeviWebservice')) {
-            require_once(dirname(__FILE__).'/classes/SyncroSeviWebservice.php');
-        }
-        
-        $webservice = new SyncroSeviWebservice($shop['url'], $shop['api_key'], true);
-        $connection = $webservice->testConnection();
-        $shopInfo = array();
-        
-        if ($connection) {
-            try {
-                $shopInfo = $webservice->getShopInfo();
-            } catch (Exception $e) {
-                // Si falla obtener info de tienda, no es crítico
-                $shopInfo = array('name' => 'Tienda conectada');
+        if (self::$staffEmails === null) {
+            $list = array(Tools::strtolower((string) Configuration::get('PS_SHOP_EMAIL')));
+            foreach ((array) Db::getInstance()->executeS('SELECT email FROM `' . _DB_PREFIX_ . 'employee` WHERE active = 1') as $e) {
+                $list[] = Tools::strtolower(trim($e['email']));
             }
-        }
-        
-        header('Content-Type: application/json');
-        die(json_encode(array(
-            'success' => $connection,
-            'message' => $connection ? 'Conexión exitosa' : 'Error de conexión',
-            'shop_info' => $shopInfo
-        )));
-        
-    } catch (Exception $e) {
-        header('Content-Type: application/json');
-        die(json_encode(array(
-            'success' => false, 
-            'message' => 'Error: ' . $e->getMessage()
-        )));
-    }
-}
-
-    /**
-     * Procesar sincronización manual
-     */
-    protected function processSyncOrders()
-    {
-        $results = $this->syncOrders();
-        $output = '';
-        
-        foreach ($results as $result) {
-            if ($result['status'] == 'success') {
-                $output .= $this->displayConfirmation($result['shop'] . ': ' . $result['count'] . ' pedidos sincronizados');
-            } else {
-                $output .= $this->displayError($result['shop'] . ': ' . $result['message']);
-            }
-        }
-        
-        return $output;
-    }
-
-    /**
-     * Procesar pedidos manual
-     */
-    protected function processOrdersAction()
-    {
-        $results = $this->processOrders();
-        $output = '';
-        
-        foreach ($results as $result) {
-            if ($result['status'] == 'success') {
-                if (isset($result['order_id'])) {
-                    $output .= $this->displayConfirmation($result['shop'] . ': Pedido #' . $result['order_id'] . ' creado con ' . $result['products_count'] . ' productos');
-                } else {
-                    $output .= $this->displayConfirmation($result['shop'] . ': ' . ($result['message'] ?: 'Procesado correctamente'));
+            foreach (preg_split('/[\s,;]+/', (string) Configuration::get('MA_MERCHANT_MAILS')) as $e) {
+                if (Validate::isEmail($e)) {
+                    $list[] = Tools::strtolower(trim($e));
                 }
-            } else {
-                $output .= $this->displayError($result['shop'] . ': ' . $result['message']);
+            }
+            self::$staffEmails = array_values(array_unique(array_filter($list)));
+        }
+
+        return self::$staffEmails;
+    }
+
+    /** ¿El correo es de un pedido clonado? (por número o referencia del pedido) */
+    private function cloneOrderInVars(array $vars)
+    {
+        $ids = array();
+        $refs = array();
+        foreach (array('{id_order}', '{order_id}', '{order_name}', '{order_reference}', '{reference}', '{order_ref}') as $key) {
+            if (!isset($vars[$key]) || !is_scalar($vars[$key])) {
+                continue;
+            }
+            $value = trim(strip_tags((string) $vars[$key]));
+            if ($value === '') {
+                continue;
+            }
+            if (ctype_digit($value)) {
+                $ids[] = (int) $value;
+            }
+            $refs[] = '"' . pSQL($value) . '"';
+        }
+        if (!$ids && !$refs) {
+            return 0;
+        }
+        $where = array();
+        if ($ids) {
+            $where[] = 'o.id_order IN (' . implode(',', array_unique($ids)) . ')';
+        }
+        if ($refs) {
+            $where[] = 'o.reference IN (' . implode(',', array_unique($refs)) . ')';
+        }
+
+        return (int) Db::getInstance()->getValue(
+            'SELECT o.id_order FROM `' . _DB_PREFIX_ . 'syncrosevi_order_tracking` t
+             JOIN `' . _DB_PREFIX_ . 'orders` o ON o.id_order = t.id_mother_order
+             WHERE t.is_clone = 1 AND (' . implode(' OR ', $where) . ')'
+        );
+    }
+
+    /** ¿Todos los destinatarios son invitados creados por el clonado que nunca han comprado directamente en la madre? */
+    private function isCloneOnlyCustomer(array $emails)
+    {
+        $db = Db::getInstance();
+        foreach ($emails as $email) {
+            $rows = (array) $db->executeS(
+                'SELECT c.id_customer, c.is_guest, cc.id_customer AS cloned
+                 FROM `' . _DB_PREFIX_ . 'customer` c
+                 LEFT JOIN `' . _DB_PREFIX_ . 'syncrosevi_clone_customer` cc ON cc.id_customer = c.id_customer
+                 WHERE c.email = "' . pSQL($email) . '" AND c.deleted = 0'
+            );
+            if (!$rows) {
+                return false;
+            }
+            foreach ($rows as $r) {
+                if (!$r['cloned'] || !(int) $r['is_guest']) {
+                    return false; // también es cliente propio de la madre
+                }
+                $own = (int) $db->getValue(
+                    'SELECT COUNT(*) FROM `' . _DB_PREFIX_ . 'orders` o
+                     WHERE o.id_customer = ' . (int) $r['id_customer'] . '
+                     AND o.id_order NOT IN (SELECT id_mother_order FROM `' . _DB_PREFIX_ . 'syncrosevi_order_tracking` WHERE is_clone = 1)'
+                );
+                if ($own) {
+                    return false;
+                }
             }
         }
-        
-        return $output;
+
+        return true;
     }
 
     /**
-     * CORREGIDO: Ver pedidos pendientes completo
+     * ======================================================================
+     * CONFIGURACIÓN
+     * ======================================================================
      */
-    protected function processViewPending()
+    public function getContent()
     {
-        $pendingOrders = Db::getInstance()->executeS(
-            'SELECT cs.name as shop_name, cs.id_child_shop,
-                   ol.id_original_order, 
-                   GROUP_CONCAT(CONCAT(ol.product_name, " (", ol.quantity, ")") SEPARATOR ", ") as products,
-                   SUM(ol.quantity) as total_quantity,
-                   COUNT(ol.id_line) as lines_count,
-                   MIN(ol.date_add) as first_sync
-            FROM `' . _DB_PREFIX_ . 'syncrosevi_order_lines` ol
-            JOIN `' . _DB_PREFIX_ . 'syncrosevi_child_shops` cs ON ol.id_child_shop = cs.id_child_shop
-            WHERE ol.processed = 0
-            GROUP BY cs.id_child_shop, ol.id_original_order
-            ORDER BY cs.name ASC, ol.date_add DESC'
-        );
-        
-        $html = '<div class="panel"><div class="panel-heading"><i class="icon-list"></i> Todos los Pedidos Pendientes de Procesamiento';
-        $html .= ' <a href="' . $this->context->link->getAdminLink('AdminModules') . '&configure=syncrosevi" class="btn btn-default btn-sm pull-right">Volver</a>';
-        $html .= '</div><div class="panel-body">';
-        
-        if (empty($pendingOrders)) {
-            $html .= '<div class="alert alert-success text-center">';
-            $html .= '<h4><i class="icon-check"></i> ¡Perfecto!</h4>';
-            $html .= '<p>No hay pedidos pendientes de procesamiento.</p>';
-            $html .= '<p>Todos los pedidos sincronizados han sido procesados correctamente.</p>';
-            $html .= '</div>';
-            
-            $html .= '<div class="text-center">';
-            $html .= '<form method="post" style="display: inline-block;">';
-            $html .= '<button type="submit" name="submitSyncOrders" class="btn btn-primary btn-lg">';
-            $html .= '<i class="icon-refresh"></i> Sincronizar Nuevos Pedidos';
-            $html .= '</button>';
-            $html .= '</form>';
-            $html .= '</div>';
-        } else {
-            $html .= '<div class="alert alert-info">';
-            $html .= '<strong>Información:</strong> Estos pedidos han sido sincronizados desde las tiendas hijas pero aún no han sido procesados. ';
-            $html .= 'Haz clic en "Procesar Pedidos" para crear los pedidos únicos en la tienda madre.';
-            $html .= '</div>';
-            
-            $html .= '<div class="table-responsive">';
-            $html .= '<table class="table table-striped table-bordered">';
-            $html .= '<thead><tr><th>Tienda Origen</th><th>Pedido #</th><th>Productos</th><th>Cantidad Total</th><th>Fecha Sincronización</th></tr></thead>';
-            $html .= '<tbody>';
-            
-            $currentShop = '';
-            foreach ($pendingOrders as $order) {
-                $html .= '<tr' . ($order['shop_name'] != $currentShop ? ' class="active"' : '') . '>';
-                
-                if ($order['shop_name'] != $currentShop) {
-                    $html .= '<td><strong>' . $order['shop_name'] . '</strong></td>';
-                    $currentShop = $order['shop_name'];
-                } else {
-                    $html .= '<td></td>';
-                }
-                
-                $html .= '<td><span class="badge badge-info">#' . $order['id_original_order'] . '</span></td>';
-                $html .= '<td><small>' . $order['products'] . '</small></td>';
-                $html .= '<td><span class="badge badge-warning">' . $order['total_quantity'] . '</span></td>';
-                $html .= '<td>' . date('d/m/Y H:i', strtotime($order['first_sync'])) . '</td>';
-                $html .= '</tr>';
-            }
-            
-            $html .= '</tbody></table></div>';
-            
-            // Resumen y botones de acción
-            $totalOrders = count($pendingOrders);
-            $totalShops = count(array_unique(array_column($pendingOrders, 'shop_name')));
-            
-            $html .= '<div class="alert alert-warning">';
-            $html .= '<strong>Resumen:</strong> Hay <strong>' . $totalOrders . '</strong> pedidos pendientes de <strong>' . $totalShops . '</strong> tiendas hijas.';
-            $html .= '</div>';
-            
-            $html .= '<div class="text-center" style="margin-top: 20px;">';
-            $html .= '<form method="post" style="display: inline-block; margin-right: 10px;">';
-            $html .= '<button type="submit" name="submitProcessOrders" class="btn btn-success btn-lg">';
-            $html .= '<i class="icon-cogs"></i> Procesar Todos los Pedidos (' . $totalOrders . ')';
-            $html .= '</button>';
-            $html .= '</form>';
-            
-            $html .= '<form method="post" style="display: inline-block;">';
-            $html .= '<button type="submit" name="submitSyncOrders" class="btn btn-primary">';
-            $html .= '<i class="icon-refresh"></i> Sincronizar Más Pedidos';
-            $html .= '</button>';
-            $html .= '</form>';
-            $html .= '</div>';
+        $updater = $this->getUpdater();
+        $output = $updater->processRequest();
+        if (!$updater->ready()) {
+            $output = $this->displayError($this->notEnabledMessage()) . $output;
         }
-        
-        $html .= '</div></div>';
-        
-        return $html;
+        $info = $updater->getInfo();
+        $panel = $updater->renderPanel();
+
+        if ($this->isFirstTime()) {
+            return !empty($info['update_available'])
+                ? $output . $panel . $this->displayInitialSetup()
+                : $output . $this->displayInitialSetup() . $panel;
         }
-  
+
+        // Con un mensaje de actualizaciones que enseñar, se queda aquí; si no, a la pantalla de SyncroSevi como siempre
+        if ($output !== '') {
+            return $output . $panel
+                . '<p><a class="btn btn-primary" href="' . Tools::safeOutput($this->context->link->getAdminLink('AdminSyncrosevi')) . '"><i class="icon-arrow-right"></i> ' . $this->l('Ir a SyncroSevi') . '</a></p>';
+        }
+
+        Tools::redirectAdmin($this->context->link->getAdminLink('AdminSyncrosevi'));
+    }
+
+    private function isFirstTime()
+    {
+        return !(int) Db::getInstance()->getValue('SELECT COUNT(*) FROM `' . _DB_PREFIX_ . 'syncrosevi_child_shops`');
+    }
+
+    private function displayInitialSetup()
+    {
+        $this->context->controller->addCSS($this->_path . 'views/css/admin.css');
+        $this->context->controller->addCSS($this->_path . 'views/css/modal.css');
+
+        $cron = _PS_MODULE_DIR_ . $this->name . '/cron/syncrosevi_cron.php';
+        $this->context->smarty->assign(array(
+            'admin_url' => $this->context->link->getAdminLink('AdminSyncrosevi'),
+            'ps_version' => _PS_VERSION_,
+            'php_version' => phpversion(),
+            'module_version' => $this->version,
+            'webhook_test_url' => $this->getWebhookUrl('test'),
+            'cron_sync_path' => $cron . ' sync',
+            'cron_process_path' => $cron . ' process',
+            'cron_stats_path' => $cron . ' stats',
+            'cron_health_path' => $cron . ' health',
+        ));
+
+        return $this->display(__FILE__, 'views/templates/admin/configure.tpl');
+    }
 }

@@ -11,11 +11,18 @@
  * @license   http://opensource.org/licenses/afl-3.0.php  Academic Free License (AFL 3.0)
  */
 
+if (!defined('_PS_VERSION_')) {
+    exit;
+}
+
 class SyncroSeviWebservice
 {
     protected $url;
     protected $key;
     protected $debug = false;
+
+    /** Tiempo máximo de cada petición (segundos) */
+    public $timeout = 30;
 
     public function __construct($url, $key, $debug = false)
     {
@@ -24,110 +31,309 @@ class SyncroSeviWebservice
         $this->debug = $debug;
     }
 
+    /** true si en la última sincronización quedaron pedidos nuevos por descargar (se bajan en la siguiente) */
+    public $hasMore = false;
+
+    /** Pedidos nuevos como máximo en cada sincronización (evita timeouts) */
+    const MAX_ORDERS_PER_SYNC = 1000;
+
+    /** Pedidos completos pedidos en cada llamada al WebService */
+    const CHUNK_SIZE = 25;
+
     /**
-     * Obtener pedidos nuevos desde la tienda hija
+     * Obtener pedidos nuevos desde la tienda hija.
+     *
+     * 1) Se pide un listado ligero (solo id y estado) de los pedidos desde $startOrderId en los estados a importar.
+     * 2) Se descartan los que ya están sincronizados ($skipIds).
+     * 3) Solo de los nuevos se descarga el detalle, en bloques.
+     *
+     * @param int $startOrderId
+     * @param string $importStates estados separados por coma
+     * @param array $skipIds IDs de pedido que ya están sincronizados
      */
-    public function getNewOrders($startOrderId = 1, $importStates = '2,3,4,5')
+    public function getNewOrders($startOrderId = 1, $importStates = '2,3,4,5', $skipIds = array())
     {
-        try {
-            $statesArray = explode(',', $importStates);
-            $statesArray = array_map('intval', $statesArray);
-            
-            if ($this->debug) {
-                error_log('SyncroSevi: Buscando pedidos desde ID ' . $startOrderId . ' con estados: ' . $importStates);
+        $this->hasMore = false;
+        $states = $this->statesArray($importStates);
+        if (empty($states)) {
+            return array();
+        }
+        $startOrderId = max(1, (int) $startOrderId);
+        $skip = array_flip(array_map('intval', (array) $skipIds));
+
+        $newIds = array();
+        $offset = 0;
+        $page = 1000;
+        do {
+            $xml = $this->get(array(
+                'resource' => 'orders',
+                'display' => '[id,current_state]',
+                'sort' => '[id_ASC]',
+                'filter' => array(
+                    'id' => '[' . $startOrderId . ',999999999]',
+                    'current_state' => '[' . implode('|', $states) . ']',
+                ),
+                'limit' => $offset . ',' . $page,
+            ));
+            $count = 0;
+            if ($xml && isset($xml->orders->order)) {
+                foreach ($xml->orders->order as $orderXml) {
+                    ++$count;
+                    $id = (int) $orderXml->id;
+                    if ($id < $startOrderId || isset($skip[$id]) || !in_array((int) $orderXml->current_state, $states)) {
+                        continue;
+                    }
+                    $newIds[] = $id;
+                }
             }
-            
-            $ordersXml = $this->get(array(
+            $offset += $page;
+        } while ($count >= $page && count($newIds) <= self::MAX_ORDERS_PER_SYNC);
+
+        if (count($newIds) > self::MAX_ORDERS_PER_SYNC) {
+            $this->hasMore = true;
+            $newIds = array_slice($newIds, 0, self::MAX_ORDERS_PER_SYNC);
+        }
+
+        if ($this->debug) {
+            $this->debugLog('Pedidos nuevos encontrados desde #' . $startOrderId . ': ' . count($newIds));
+        }
+
+        return $this->getOrdersByIds($newIds, $importStates);
+    }
+
+    /**
+     * Descargar pedidos concretos con sus líneas (solo los que estén en un estado a importar)
+     */
+    public function getOrdersByIds(array $ids, $importStates = '2,3,4,5')
+    {
+        $states = $this->statesArray($importStates);
+        $ids = array_values(array_filter(array_map('intval', $ids)));
+        $orders = array();
+
+        foreach (array_chunk($ids, self::CHUNK_SIZE) as $chunk) {
+            $xml = $this->get(array(
                 'resource' => 'orders',
                 'display' => 'full',
-                'sort' => 'id_DESC',
-                'limit' => '100'
+                'sort' => '[id_ASC]',
+                'filter' => array('id' => '[' . implode('|', $chunk) . ']'),
             ));
-            
-            if (!$ordersXml || !isset($ordersXml->orders)) {
-                if ($this->debug) {
-                    error_log('SyncroSevi: No se encontraron pedidos o respuesta XML inválida');
-                }
-                return array();
+            if (!$xml || !isset($xml->orders->order)) {
+                continue;
             }
 
-            $orders = array();
-            
-            foreach ($ordersXml->orders->order as $orderXml) {
-                $orderId = (int)$orderXml->id;
-                $currentState = (int)$orderXml->current_state;
-                
-                if ($orderId < $startOrderId) {
-                    if ($this->debug) {
-                        error_log('SyncroSevi: Pedido #' . $orderId . ' omitido (menor que ' . $startOrderId . ')');
-                    }
+            foreach ($xml->orders->order as $orderXml) {
+                $orderId = (int) $orderXml->id;
+                $currentState = (int) $orderXml->current_state;
+                if (!in_array($currentState, $states)) {
                     continue;
                 }
-                
-                if (!in_array($currentState, $statesArray)) {
-                    if ($this->debug) {
-                        error_log('SyncroSevi: Pedido #' . $orderId . ' omitido (estado ' . $currentState . ' no permitido)');
-                    }
-                    continue;
-                }
-                
-                if ($this->debug) {
-                    error_log('SyncroSevi: Procesando pedido #' . $orderId . ' (estado: ' . $currentState . ')');
-                }
-                
+
                 $order = array(
                     'id' => $orderId,
-                    'reference' => (string)$orderXml->reference,
+                    'reference' => (string) $orderXml->reference,
                     'current_state' => $currentState,
-                    'date_add' => (string)$orderXml->date_add,
-                    'order_rows' => array()
+                    'date_add' => (string) $orderXml->date_add,
+                    'order_rows' => array(),
                 );
 
-                try {
-                    $orderDetailsXml = $this->get(array(
-                        'resource' => 'order_details',
-                        'filter' => array('id_order' => $orderId),
-                        'display' => 'full'
-                    ));
-
-                    if ($orderDetailsXml && isset($orderDetailsXml->order_details)) {
-                        $details = $orderDetailsXml->order_details->order_detail;
-                        
-                        if (!is_array($details) && !($details instanceof Traversable)) {
-                            $details = array($details);
+                // Las líneas vienen ya en el propio pedido (associations/order_rows)
+                if (isset($orderXml->associations->order_rows->order_row)) {
+                    foreach ($orderXml->associations->order_rows->order_row as $row) {
+                        if (!isset($row->product_reference)) {
+                            $order['order_rows'] = array();
+                            break; // formato inesperado: se piden las líneas aparte
                         }
-                        
-                        foreach ($details as $detailXml) {
-                            $order['order_rows'][] = array(
-                                'product_id' => (int)$detailXml->product_id,
-                                'product_attribute_id' => (int)$detailXml->product_attribute_id,
-                                'product_quantity' => (int)$detailXml->product_quantity,
-                                'product_reference' => (string)$detailXml->product_reference,
-                                'product_name' => (string)$detailXml->product_name
-                            );
-                        }
+                        $order['order_rows'][] = array(
+                            'product_id' => (int) $row->product_id,
+                            'product_attribute_id' => (int) $row->product_attribute_id,
+                            'product_quantity' => (int) $row->product_quantity,
+                            'product_reference' => (string) $row->product_reference,
+                            'product_name' => (string) $row->product_name,
+                        );
                     }
-                } catch (Exception $e) {
-                    if ($this->debug) {
-                        error_log('SyncroSevi: Error obteniendo detalles del pedido #' . $orderId . ': ' . $e->getMessage());
-                    }
-                    continue;
                 }
 
-                $orders[] = $order;
-            }
+                if (empty($order['order_rows'])) {
+                    try {
+                        $order['order_rows'] = $this->getOrderDetails($orderId);
+                    } catch (Exception $e) {
+                        if ($this->debug) {
+                            $this->debugLog('Error obteniendo detalles del pedido #' . $orderId . ': ' . $e->getMessage());
+                        }
+                        continue; // se reintenta en la siguiente sincronización
+                    }
+                }
 
-            if ($this->debug) {
-                error_log('SyncroSevi: Total de pedidos procesados: ' . count($orders));
+                if (!empty($order['order_rows'])) {
+                    $orders[] = $order;
+                }
             }
+        }
 
-            return $orders;
-            
-        } catch (Exception $e) {
-            if ($this->debug) {
-                error_log('SyncroSevi WebService Error: ' . $e->getMessage());
+        return $orders;
+    }
+
+    /**
+     * Líneas de un pedido desde el recurso order_details
+     */
+    public function getOrderDetails($orderId)
+    {
+        $rows = array();
+        $xml = $this->get(array(
+            'resource' => 'order_details',
+            'filter' => array('id_order' => '[' . (int) $orderId . ']'),
+            'display' => 'full',
+        ));
+        if ($xml && isset($xml->order_details->order_detail)) {
+            foreach ($xml->order_details->order_detail as $detailXml) {
+                $rows[] = array(
+                    'product_id' => (int) $detailXml->product_id,
+                    'product_attribute_id' => (int) $detailXml->product_attribute_id,
+                    'product_quantity' => (int) $detailXml->product_quantity,
+                    'product_reference' => (string) $detailXml->product_reference,
+                    'product_name' => (string) $detailXml->product_name,
+                );
             }
-            throw $e;
+        }
+
+        return $rows;
+    }
+
+    /**
+     * ======================================================================
+     * MODO CLONAR: lecturas de un solo recurso
+     * ======================================================================
+     */
+
+    /** Un recurso por ID (orders, customers, addresses...) como nodo XML, o null si no existe */
+    public function getOne($resource, $id)
+    {
+        $id = (int) $id;
+        if ($id <= 0) {
+            return null;
+        }
+        $xml = $this->get(array('resource' => $resource, 'id' => $id));
+        if ($xml) {
+            foreach ($xml->children() as $child) {
+                return $child;
+            }
+        }
+
+        return null;
+    }
+
+    /** Lista de un recurso filtrada (display=full) como array de nodos XML */
+    public function getList($resource, array $filter, $limit = null)
+    {
+        $options = array('resource' => $resource, 'display' => 'full', 'filter' => $filter);
+        if ($limit) {
+            $options['limit'] = $limit;
+        }
+        $xml = $this->get($options);
+        $out = array();
+        if ($xml) {
+            foreach ($xml->children() as $list) {
+                foreach ($list->children() as $item) {
+                    $out[] = $item;
+                }
+            }
+        }
+
+        return $out;
+    }
+
+    /** Líneas completas de un pedido (precios, totales e impuestos) */
+    public function getOrderDetailsFull($orderId)
+    {
+        $rows = array();
+        foreach ($this->getList('order_details', array('id_order' => '[' . (int) $orderId . ']')) as $d) {
+            $taxIds = array();
+            if (isset($d->associations->taxes->tax)) {
+                foreach ($d->associations->taxes->tax as $t) {
+                    if ((int) $t->id) {
+                        $taxIds[] = (int) $t->id;
+                    }
+                }
+            }
+            $row = array('id' => (int) $d->id, 'tax_ids' => $taxIds);
+            foreach (array('product_id', 'product_attribute_id', 'product_quantity') as $f) {
+                $row[$f] = (int) $d->{$f};
+            }
+            foreach (array('product_name', 'product_reference', 'product_ean13', 'product_isbn', 'product_upc', 'product_supplier_reference') as $f) {
+                $row[$f] = isset($d->{$f}) ? (string) $d->{$f} : '';
+            }
+            foreach (array('product_price', 'reduction_percent', 'reduction_amount', 'reduction_amount_tax_incl', 'reduction_amount_tax_excl',
+                'group_reduction', 'ecotax', 'unit_price_tax_incl', 'unit_price_tax_excl', 'total_price_tax_incl', 'total_price_tax_excl',
+                'original_product_price', 'product_weight') as $f) {
+                $row[$f] = isset($d->{$f}) ? (float) $d->{$f} : 0.0;
+            }
+            $rows[] = $row;
+        }
+
+        return $rows;
+    }
+
+    /**
+     * Cambia el estado de un pedido de la hija (POST order_histories).
+     * Con $sendEmail la hija envía al cliente el correo de ese estado, como si lo cambiaras a mano allí.
+     */
+    public function addOrderHistory($idOrder, $idState, $sendEmail = false)
+    {
+        $xml = '<?xml version="1.0" encoding="UTF-8"?>'
+            . '<prestashop xmlns:xlink="http://www.w3.org/1999/xlink"><order_history>'
+            . '<id_order>' . (int) $idOrder . '</id_order>'
+            . '<id_order_state>' . (int) $idState . '</id_order_state>'
+            . '</order_history></prestashop>';
+        $url = $this->url . 'api/order_histories' . ($sendEmail ? '?sendemail=1' : '');
+        if ($this->debug) {
+            $this->debugLog('POST ' . $url . ' (pedido ' . (int) $idOrder . ' -> estado ' . (int) $idState . ')');
+        }
+        $request = $this->executeRequest($url, array(
+            CURLOPT_CUSTOMREQUEST => 'POST',
+            CURLOPT_POSTFIELDS => $xml,
+        ));
+        $this->checkStatusCode($request);
+
+        return true;
+    }
+
+    /** Estado actual (y número de seguimiento) de varios pedidos: array(id => array('state' => int, 'tracking' => string)) */
+    public function getOrderStates(array $ids)
+    {
+        $out = array();
+        $ids = array_values(array_filter(array_map('intval', $ids)));
+        foreach (array_chunk($ids, 100) as $chunk) {
+            $query = array(
+                'resource' => 'orders',
+                'display' => '[id,current_state,shipping_number]',
+                'filter' => array('id' => '[' . implode('|', $chunk) . ']'),
+            );
+            try {
+                $xml = $this->get($query);
+            } catch (Exception $e) {
+                $query['display'] = '[id,current_state]'; // versiones sin shipping_number
+                $xml = $this->get($query);
+            }
+            if ($xml && isset($xml->orders->order)) {
+                foreach ($xml->orders->order as $o) {
+                    $out[(int) $o->id] = array('state' => (int) $o->current_state, 'tracking' => trim((string) $o->shipping_number));
+                }
+            }
+        }
+
+        return $out;
+    }
+
+    private function statesArray($importStates)
+    {
+        return array_values(array_filter(array_map('intval', explode(',', (string) $importStates))));
+    }
+
+    private function debugLog($message)
+    {
+        $module = Module::getInstanceByName('syncrosevi');
+        if ($module && method_exists($module, 'log')) {
+            $module->log('WS ' . $this->url . ': ' . $message, true);
         }
     }
 
@@ -168,7 +374,7 @@ class SyncroSeviWebservice
     }
 
     if ($this->debug) {
-        error_log('SyncroSevi: GET Request URL: ' . $url);
+        $this->debugLog('GET ' . $url);
     }
 
     $request = $this->executeRequest($url, array(
@@ -194,10 +400,10 @@ class SyncroSeviWebservice
             ),
             CURLOPT_SSL_VERIFYPEER => false,
             CURLOPT_SSL_VERIFYHOST => false,
-            CURLOPT_TIMEOUT => 30,
-            CURLOPT_CONNECTTIMEOUT => 10,
+            CURLOPT_TIMEOUT => (int) $this->timeout,
+            CURLOPT_CONNECTTIMEOUT => min(10, (int) $this->timeout),
             CURLOPT_FOLLOWLOCATION => true,
-            CURLOPT_USERAGENT => 'SyncroSevi/1.0'
+            CURLOPT_USERAGENT => 'SyncroSevi/1.1'
         );
 
         $curl = curl_init($url);
@@ -205,6 +411,30 @@ class SyncroSeviWebservice
         curl_setopt_array($curl, $curlOptions);
 
         $response = curl_exec($curl);
+
+        // Si no llega ni a conectar (tiempo agotado o conexión fallida), un reintento por IPv4 y con más margen:
+        // cubre servidores con IPv6 mal configurado y cortes momentáneos de la tienda hija
+        if ($response === false && in_array(curl_errno($curl), array(7, 28)) && !curl_getinfo($curl, CURLINFO_CONNECT_TIME)) {
+            $firstError = curl_error($curl);
+            curl_close($curl);
+            if ($this->debug) {
+                $this->debugLog('Reintento por IPv4 tras: ' . $firstError);
+            }
+            $curl = curl_init($url);
+            curl_setopt_array($curl, $defaultOptions);
+            curl_setopt_array($curl, $curlOptions);
+            curl_setopt($curl, CURLOPT_CONNECTTIMEOUT, 20);
+            if (defined('CURLOPT_IPRESOLVE') && defined('CURL_IPRESOLVE_V4')) {
+                curl_setopt($curl, CURLOPT_IPRESOLVE, CURL_IPRESOLVE_V4);
+            }
+            $response = curl_exec($curl);
+            if ($response === false) {
+                $error = curl_error($curl);
+                curl_close($curl);
+                throw new Exception('CURL Error: ' . $error . ' (también tras reintentar: la tienda hija no acepta conexiones desde este servidor ahora mismo)');
+            }
+        }
+
         $httpCode = curl_getinfo($curl, CURLINFO_HTTP_CODE);
         $headerSize = curl_getinfo($curl, CURLINFO_HEADER_SIZE);
         
@@ -220,8 +450,7 @@ class SyncroSeviWebservice
         $body = substr($response, $headerSize);
 
         if ($this->debug) {
-            error_log('SyncroSevi: HTTP Code: ' . $httpCode);
-            error_log('SyncroSevi: Response Body: ' . substr($body, 0, 500) . '...');
+            $this->debugLog('HTTP ' . $httpCode . ' (' . strlen($body) . ' bytes)');
         }
 
         return array(
@@ -307,7 +536,7 @@ public function testConnection()
         
     } catch (Exception $e) {
         if ($this->debug) {
-            error_log('SyncroSevi: Test connection failed: ' . $e->getMessage());
+            $this->debugLog('Test de conexión fallido: ' . $e->getMessage());
         }
         return false;
     }
@@ -331,7 +560,7 @@ public function testConnection()
             return array();
         } catch (Exception $e) {
             if ($this->debug) {
-                error_log('SyncroSevi: Get shop info failed: ' . $e->getMessage());
+                $this->debugLog('Error obteniendo datos de la tienda: ' . $e->getMessage());
             }
             return array();
         }
