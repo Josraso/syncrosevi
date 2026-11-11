@@ -6,6 +6,7 @@
 * This source file is subject to the Academic Free License (AFL 3.0)
 *}
 
+{if !empty($updater_notice)}{$updater_notice nofilter}{/if}
 {if isset($updater_panel) && $updater_top}{$updater_panel nofilter}{/if}
 <div class="syncrosevi-panel">
     

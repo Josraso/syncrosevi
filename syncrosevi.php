@@ -39,7 +39,7 @@ class Syncrosevi extends Module
     {
         $this->name = 'syncrosevi';
         $this->tab = 'administration';
-        $this->version = '1.3.0';
+        $this->version = '1.3.1';
         $this->author = 'SyncroSevi Team';
         $this->need_instance = 0;
         $this->ps_versions_compliancy = array(
@@ -131,7 +131,23 @@ class Syncrosevi extends Module
      * ======================================================================
      */
 
+    /** true mientras se instala: PrestaShop activa el módulo dentro de install() */
+    private static $setup = false;
+
     public function install()
+    {
+        self::$setup = true;
+        $ok = $this->installSteps();
+        self::$setup = false;
+        if ($ok && !$this->getUpdater()->canEnable()) {
+            // Instalado, pero desactivado hasta que la tienda tenga su licencia
+            $this->disable();
+        }
+
+        return $ok;
+    }
+
+    private function installSteps()
     {
         if (!parent::install()
             || !$this->createTables()
@@ -153,10 +169,9 @@ class Syncrosevi extends Module
     public function enable($force_all = false)
     {
         $updater = $this->getUpdater();
-        if (!$updater->ready()) {
-            $updater->check(5);
-        }
-        if (!$updater->ready()) {
+        if (!self::$setup && !$updater->canEnable()) {
+            $this->_errors[] = $updater->noticeText();
+
             return false;
         }
 
@@ -178,15 +193,6 @@ class Syncrosevi extends Module
     public function hookActionListModules($params)
     {
         return $this->getUpdater()->getNativeModuleList();
-    }
-
-    /** Aviso para el back-office cuando la tienda no está habilitada */
-    public function notEnabledMessage()
-    {
-        return sprintf(
-            $this->l('SyncroSevi no está habilitado para esta tienda (%s): no sincronizará ni procesará pedidos. Escribe a Josra indicando este dominio para darlo de alta.'),
-            Tools::getShopDomainSsl(false) . __PS_BASE_URI__
-        );
     }
 
     public function uninstall()
@@ -1827,10 +1833,7 @@ class Syncrosevi extends Module
     public function getContent()
     {
         $updater = $this->getUpdater();
-        $output = $updater->processRequest();
-        if (!$updater->ready()) {
-            $output = $this->displayError($this->notEnabledMessage()) . $output;
-        }
+        $output = $updater->processRequest(); // incluye el cartel de licencia si hace falta
         $info = $updater->getInfo();
         $panel = $updater->renderPanel();
 

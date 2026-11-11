@@ -212,10 +212,8 @@ class AdminSyncroseviController extends ModuleAdminController
         $this->context->smarty->assign(array(
             'updater_panel' => $updater->renderPanel(),
             'updater_top' => !empty($info['update_available']),
+            'updater_notice' => $updater->renderNotice(),
         ));
-        if (!$updater->ready()) {
-            $this->errors[] = $this->module->notEnabledMessage();
-        }
 
         $this->setTemplate('main.tpl');
     }

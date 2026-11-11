@@ -382,6 +382,63 @@ class SyncroseviUpdater
         return $e === 0 || time() < $e;
     }
 
+    /**
+     * Para enable() del módulo: si la tienda aún no tiene su alta guardada, la pide
+     * al servidor en ese momento.
+     */
+    public function canEnable()
+    {
+        if (!$this->ready()) {
+            $this->check(5);
+        }
+
+        return $this->ready();
+    }
+
+    /** Texto para el error de PrestaShop cuando se intenta activar sin alta */
+    public function noticeText()
+    {
+        return sprintf(
+            '%s necesita licencia para esta tienda (%s). Pide la licencia a Josra indicando este dominio y, cuando te confirme que ya la tienes, vuelve a pulsar «Activar».',
+            $this->module->displayName,
+            rtrim($this->site(), '/')
+        );
+    }
+
+    /**
+     * Cartel grande para la configuración del módulo: sin alta, o con alta pero desactivado.
+     * Lleva un botón que comprueba el alta y activa el módulo ahí mismo. Vacío si todo está bien.
+     */
+    public function renderNotice()
+    {
+        if (self::CHANNEL == 0) {
+            return '';
+        }
+        $ready = $this->ready();
+        if ($ready && $this->module->active) {
+            return '';
+        }
+        $name = Tools::safeOutput($this->module->displayName);
+        if ($ready) {
+            $title = $name . ' está desactivado';
+            $text = 'La licencia de esta tienda está bien, pero el módulo está desactivado. Pulsa el botón para activarlo.';
+            $button = 'Activar el módulo';
+        } else {
+            $title = $name . ' necesita licencia para esta tienda';
+            $text = 'Esta tienda (<strong>' . Tools::safeOutput(rtrim($this->site(), '/')) . '</strong>) no tiene licencia de este módulo, así que está desactivado y no hace nada. '
+                . 'Pide la licencia a Josra indicando este dominio.</p>'
+                . '<p>Cuando te confirme que ya la tienes, <strong>vuelve aquí y pulsa el botón</strong>: el módulo comprobará la licencia y se activará solo.';
+            $button = 'Ya tengo la licencia: activar el módulo';
+        }
+
+        return '<form method="post" action="' . Tools::safeOutput($this->configUrl()) . '">'
+            . '<div class="alert alert-danger" style="font-size:15px;line-height:1.5;padding:18px 22px">'
+            . '<h4 style="font-size:19px;margin:0 0 10px">' . $title . '</h4>'
+            . '<p>' . $text . '</p>'
+            . '<p style="margin:16px 0 0"><button type="submit" name="josraupd_on" value="1" class="btn btn-primary btn-lg"><i class="icon-unlock"></i> ' . $button . '</button></p>'
+            . '</div></form>';
+    }
+
     /* ------------------------------------------------------------------ */
     /* Configuración del módulo: acciones y panel                          */
     /* ------------------------------------------------------------------ */
@@ -395,6 +452,17 @@ class SyncroseviUpdater
 
         // Autorreparación: hooks del actualizador (por si el módulo se subió por FTP)
         $this->registerHooks();
+
+        // Botón del cartel: comprobar el alta y activar el módulo
+        if (Tools::isSubmit('josraupd_on')) {
+            if ($this->canEnable() && ($this->module->active || $this->module->enable())) {
+                $this->module->active = 1;
+                $html .= $this->module->displayConfirmation('Licencia comprobada: el módulo ya está activado.');
+            } else {
+                $html .= $this->module->displayError('Todavía no consta la licencia para ' . rtrim($this->site(), '/') . '. Si te acaban de confirmar que la tienes, espera un minuto y vuelve a pulsar el botón.');
+            }
+        }
+        $html .= $this->renderNotice();
 
         if (Tools::getValue('josraupd_done')) {
             $html .= $this->module->displayConfirmation(sprintf('Módulo actualizado a la versión %s.', $this->module->version));
