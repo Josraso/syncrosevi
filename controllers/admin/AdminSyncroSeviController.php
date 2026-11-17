@@ -607,16 +607,56 @@ class AdminSyncroseviController extends ModuleAdminController
                 $order['order_url'] = $this->getOrderAdminUrl($order['id_mother_order']);
                 $order['total_paid'] = number_format((float) $order['total_paid'], 2, ',', '.');
                 $order['total_products'] = (int) $order['total_products'];
+                $order['missing_count'] = (int) $order['missing_count'];
+                $order['missing_qty'] = (int) $order['missing_qty'];
+                $order['legacy_lines'] = (int) $order['legacy_lines'];
+                $order['original_ids'] = $this->idList($order['original_ids']);
+                $order['date_processed'] = $this->esDate($order['date_processed']);
             }
             unset($order);
 
-            $this->ajaxResponse(true, 'success', array('orders' => $orders, 'total' => $total));
+            // Lotes que no crearon pedido madre (ninguna referencia coincidía): solo en la primera página
+            $orphans = $page === 1 ? $this->getOrphanBatches() : array();
+
+            $this->ajaxResponse(true, 'success', array('orders' => $orders, 'total' => $total, 'orphans' => $orphans));
         } catch (Exception $e) {
             $this->ajaxResponse(false, $e->getMessage());
         }
     }
 
-    /** Filtros de pedidos procesados (tienda, fechas, búsqueda) */
+    /** Lista de IDs separada por comas → array de enteros */
+    protected function idList($csv)
+    {
+        return array_values(array_filter(array_map('intval', explode(',', (string) $csv))));
+    }
+
+    /** Fecha de la base de datos en formato castellano (dd/mm/aaaa hh:mm) */
+    protected function esDate($date, $seconds = false)
+    {
+        if (!$date || strpos((string) $date, '0000-00-00') === 0) {
+            return '';
+        }
+        $ts = strtotime((string) $date);
+
+        return $ts ? date($seconds ? 'd/m/Y H:i:s' : 'd/m/Y H:i', $ts) : '';
+    }
+
+    /** FROM/WHERE de las líneas de un pedido madre (o.id_order) */
+    protected function motherLinesSql()
+    {
+        return 'FROM `' . _DB_PREFIX_ . 'syncrosevi_order_lines` l
+                JOIN `' . _DB_PREFIX_ . 'syncrosevi_order_tracking` t2
+                    ON (t2.id_child_shop = l.id_child_shop AND t2.id_original_order = l.id_original_order)
+                WHERE t2.id_mother_order = o.id_order';
+    }
+
+    /** Condición «línea que se quedó fuera» */
+    protected function missingCond($alias = 'l')
+    {
+        return $alias . '.import_status IN (' . (int) Syncrosevi::LINE_NOT_FOUND . ',' . (int) Syncrosevi::LINE_NO_REFERENCE . ')';
+    }
+
+    /** Filtros de pedidos procesados (tienda, fechas, búsqueda, solo con productos fuera) */
     protected function getProcessedWhere()
     {
         $where = 'ot.processed = 1 AND ot.id_mother_order > 0';
@@ -636,7 +676,26 @@ class AdminSyncroseviController extends ModuleAdminController
         }
         if ($search !== '') {
             $s = pSQL($search);
-            $where .= ' AND (o.reference LIKE "%' . $s . '%" OR o.id_order = ' . (int) $search . ' OR c.firstname LIKE "%' . $s . '%" OR c.lastname LIKE "%' . $s . '%" OR c.email LIKE "%' . $s . '%")';
+            $s = str_replace(array('%', '_'), array('\%', '\_'), $s);
+            $or = array(
+                'o.reference LIKE "%' . $s . '%"',
+                'c.firstname LIKE "%' . $s . '%"',
+                'c.lastname LIKE "%' . $s . '%"',
+                'c.email LIKE "%' . $s . '%"',
+                // Referencia del pedido de la hija (guardada desde la 1.4.0)
+                'EXISTS (SELECT 1 FROM `' . _DB_PREFIX_ . 'syncrosevi_order_tracking` t3 WHERE t3.id_mother_order = o.id_order AND t3.child_reference LIKE "%' . $s . '%")',
+                // Referencia de un producto que se quedó fuera
+                'EXISTS (SELECT 1 ' . $this->motherLinesSql() . ' AND ' . $this->missingCond() . ' AND l.product_reference LIKE "%' . $s . '%")',
+            );
+            if (ctype_digit($search)) {
+                // Número: el pedido madre o el pedido de la hija que va dentro
+                $or[] = 'o.id_order = ' . (int) $search;
+                $or[] = 'EXISTS (SELECT 1 FROM `' . _DB_PREFIX_ . 'syncrosevi_order_tracking` t3 WHERE t3.id_mother_order = o.id_order AND t3.id_original_order = ' . (int) $search . ')';
+            }
+            $where .= ' AND (' . implode(' OR ', $or) . ')';
+        }
+        if (Tools::getValue('onlyMissing')) {
+            $where .= ' AND EXISTS (SELECT 1 ' . $this->motherLinesSql() . ' AND ' . $this->missingCond() . ')';
         }
 
         return $where;
@@ -654,7 +713,11 @@ class AdminSyncroseviController extends ModuleAdminController
                     MAX(CONCAT(c.firstname, " ", c.lastname)) AS customer_name,
                     MAX(c.email) AS customer_email,
                     COUNT(DISTINCT ot.id_original_order) AS original_orders,
+                    GROUP_CONCAT(DISTINCT ot.id_original_order ORDER BY ot.id_original_order SEPARATOR ",") AS original_ids,
                     (SELECT SUM(od.product_quantity) FROM `' . _DB_PREFIX_ . 'order_detail` od WHERE od.id_order = o.id_order) AS total_products,
+                    (SELECT COUNT(DISTINCT IF(l.product_reference <> "", l.product_reference, CONCAT("#", l.product_name))) ' . $this->motherLinesSql() . ' AND ' . $this->missingCond() . ') AS missing_count,
+                    (SELECT IFNULL(SUM(l.quantity), 0) ' . $this->motherLinesSql() . ' AND ' . $this->missingCond() . ') AS missing_qty,
+                    (SELECT COUNT(*) ' . $this->motherLinesSql() . ' AND l.import_status = 0) AS legacy_lines,
                     MAX(ot.date_processed) AS date_processed
                 FROM `' . _DB_PREFIX_ . 'syncrosevi_order_tracking` ot
                 JOIN `' . _DB_PREFIX_ . 'syncrosevi_child_shops` cs ON ot.id_child_shop = cs.id_child_shop
@@ -663,6 +726,89 @@ class AdminSyncroseviController extends ModuleAdminController
                 WHERE ' . $where . '
                 GROUP BY o.id_order, o.reference, o.total_paid_tax_incl, o.date_add
                 ORDER BY date_processed DESC, o.id_order DESC';
+    }
+
+    /**
+     * Lotes procesados sin pedido madre (ninguna referencia existía en la madre), con los mismos filtros.
+     *
+     * @param int $limit
+     *
+     * @return array
+     */
+    protected function getOrphanBatches($limit = 50)
+    {
+        $db = Db::getInstance();
+        $where = 'ot.processed = 1 AND (ot.id_mother_order = 0 OR ot.id_mother_order IS NULL) AND ot.is_clone = 0';
+        $shop = trim((string) Tools::getValue('shop', ''));
+        $dateFrom = (string) Tools::getValue('dateFrom', '');
+        $dateTo = (string) Tools::getValue('dateTo', '');
+        $search = trim((string) Tools::getValue('search', ''));
+        if ($shop !== '') {
+            $where .= ctype_digit($shop) ? ' AND cs.id_child_shop = ' . (int) $shop : ' AND cs.name LIKE "%' . pSQL($shop) . '%"';
+        }
+        if ($dateFrom && Validate::isDate($dateFrom)) {
+            $where .= ' AND ot.date_processed >= "' . pSQL($dateFrom) . ' 00:00:00"';
+        }
+        if ($dateTo && Validate::isDate($dateTo)) {
+            $where .= ' AND ot.date_processed <= "' . pSQL($dateTo) . ' 23:59:59"';
+        }
+        if ($search !== '') {
+            $s = str_replace(array('%', '_'), array('\%', '\_'), pSQL($search));
+            $or = array(
+                'ot.child_reference LIKE "%' . $s . '%"',
+                'EXISTS (SELECT 1 FROM `' . _DB_PREFIX_ . 'syncrosevi_order_lines` l WHERE l.id_child_shop = ot.id_child_shop AND l.id_original_order = ot.id_original_order AND l.product_reference LIKE "%' . $s . '%")',
+            );
+            if (ctype_digit($search)) {
+                $or[] = 'ot.id_original_order = ' . (int) $search;
+            }
+            $where .= ' AND (' . implode(' OR ', $or) . ')';
+        }
+
+        $batches = (array) $db->executeS(
+            'SELECT ot.id_child_shop, ot.date_processed, MAX(cs.name) AS shop_name,
+                    GROUP_CONCAT(ot.id_original_order ORDER BY ot.id_original_order SEPARATOR ",") AS original_ids
+             FROM `' . _DB_PREFIX_ . 'syncrosevi_order_tracking` ot
+             JOIN `' . _DB_PREFIX_ . 'syncrosevi_child_shops` cs ON ot.id_child_shop = cs.id_child_shop
+             WHERE ' . $where . '
+             GROUP BY ot.id_child_shop, ot.date_processed
+             ORDER BY ot.date_processed DESC
+             LIMIT ' . (int) $limit
+        );
+
+        $result = array();
+        foreach ($batches as $b) {
+            $ids = $this->idList($b['original_ids']);
+            if (!$ids) {
+                continue;
+            }
+            $lines = (array) $db->executeS(
+                'SELECT l.product_reference, l.product_name, l.quantity, l.id_original_order, l.import_status
+                 FROM `' . _DB_PREFIX_ . 'syncrosevi_order_lines` l
+                 WHERE l.id_child_shop = ' . (int) $b['id_child_shop'] . ' AND l.id_original_order IN (' . implode(',', $ids) . ')'
+            );
+            $out = array();
+            $legacy = false;
+            foreach ($lines as $line) {
+                if ((int) $line['import_status'] === Syncrosevi::LINE_NOT_FOUND || (int) $line['import_status'] === Syncrosevi::LINE_NO_REFERENCE) {
+                    $out[] = $line;
+                } elseif ((int) $line['import_status'] === Syncrosevi::LINE_PENDING) {
+                    $legacy = true;
+                }
+            }
+            if ($legacy && !$out) {
+                // Lote anterior a la 1.4.0: no se guardó qué entró; se enseñan todas sus líneas
+                $out = $lines;
+            }
+            $result[] = array(
+                'shop_name' => $b['shop_name'],
+                'date_processed' => $this->esDate($b['date_processed']),
+                'original_ids' => $ids,
+                'missing' => Syncrosevi::groupMissing($out),
+                'legacy' => $legacy && count($out) === count($lines),
+            );
+        }
+
+        return $result;
     }
 
     /** Enlace a la ficha del pedido (Symfony en 1.7.7+, clásico antes) */
@@ -718,6 +864,7 @@ class AdminSyncroseviController extends ModuleAdminController
                     MAX(cs.name) as shop_name,
                     COUNT(DISTINCT ot.id_original_order) as original_orders,
                     GROUP_CONCAT(ot.id_original_order ORDER BY ot.id_original_order SEPARATOR ", ") as original_ids,
+                    GROUP_CONCAT(IF(ot.child_reference <> "", CONCAT("#", ot.id_original_order, " (", ot.child_reference, ")"), CONCAT("#", ot.id_original_order)) ORDER BY ot.id_original_order SEPARATOR ", ") as original_labels,
                     MIN(ot.date_sync) as date_sync,
                     MAX(ot.date_processed) as date_processed
                 FROM `' . _DB_PREFIX_ . 'syncrosevi_order_tracking` ot
@@ -725,6 +872,30 @@ class AdminSyncroseviController extends ModuleAdminController
                 WHERE ot.id_mother_order = ' . $orderId . '
                 GROUP BY cs.id_child_shop
             ');
+
+            if ($syncInfo) {
+                $syncInfo['date_sync'] = $this->esDate($syncInfo['date_sync']);
+                $syncInfo['date_processed'] = $this->esDate($syncInfo['date_processed']);
+            }
+
+            // Productos que se quedaron fuera (agrupados por referencia) y si el pedido es anterior a la 1.4.0
+            $lineRows = (array) Db::getInstance()->executeS(
+                'SELECT l.product_reference, l.product_name, l.quantity, l.id_original_order, l.import_status
+                 FROM `' . _DB_PREFIX_ . 'syncrosevi_order_lines` l
+                 JOIN `' . _DB_PREFIX_ . 'syncrosevi_order_tracking` t2
+                    ON (t2.id_child_shop = l.id_child_shop AND t2.id_original_order = l.id_original_order)
+                 WHERE t2.id_mother_order = ' . $orderId
+            );
+            $missingLines = array();
+            $legacy = false;
+            foreach ($lineRows as $line) {
+                $st = (int) $line['import_status'];
+                if ($st === Syncrosevi::LINE_NOT_FOUND || $st === Syncrosevi::LINE_NO_REFERENCE) {
+                    $missingLines[] = $line;
+                } elseif ($st === Syncrosevi::LINE_PENDING) {
+                    $legacy = true;
+                }
+            }
 
             // Solo los campos que usa la ventana (no se envía el pedido entero con secure_key, etc.)
             $data = array(
@@ -736,7 +907,7 @@ class AdminSyncroseviController extends ModuleAdminController
                 'delivery_address' => $order['delivery_address'],
                 'carrier_name' => $order['carrier_name'],
                 'payment' => $order['payment'],
-                'date_add' => $order['date_add'],
+                'date_add' => $this->esDate($order['date_add']),
                 'total_paid' => number_format((float) $order['total_paid_tax_incl'], 2, ',', '.'),
                 'total_paid_tax_incl' => $order['total_paid_tax_incl'],
                 'total_products' => $order['total_products'],
@@ -744,6 +915,8 @@ class AdminSyncroseviController extends ModuleAdminController
                 'order_url' => $this->getOrderAdminUrl($orderId),
                 'products' => $products,
                 'sync_info' => $syncInfo,
+                'missing' => Syncrosevi::groupMissing($missingLines),
+                'legacy' => $legacy,
             );
 
             $this->ajaxResponse(true, 'success', array('order' => $data));
@@ -794,10 +967,20 @@ class AdminSyncroseviController extends ModuleAdminController
         fwrite($output, "\xEF\xBB\xBF"); // BOM para que Excel lea bien los acentos
         fputcsv($output, array(
             'ID Pedido Madre', 'Referencia', 'Tienda Origen', 'Cliente', 'Email',
-            'Pedidos Originales', 'Total Productos', 'Total Pagado', 'Fecha Procesado',
+            'Pedidos Originales', 'IDs pedidos hija', 'Total Productos', 'Total Pagado', 'Fecha Procesado',
+            'Productos fuera', 'Unidades fuera', 'Detalle productos fuera',
         ), ';');
 
+        $db = Db::getInstance();
         foreach ((array) $orders as $order) {
+            $lines = (array) $db->executeS(
+                'SELECT l.product_reference, l.product_name, l.quantity, l.id_original_order
+                 FROM `' . _DB_PREFIX_ . 'syncrosevi_order_lines` l
+                 JOIN `' . _DB_PREFIX_ . 'syncrosevi_order_tracking` t2
+                    ON (t2.id_child_shop = l.id_child_shop AND t2.id_original_order = l.id_original_order)
+                 WHERE t2.id_mother_order = ' . (int) $order['id_mother_order'] . ' AND ' . $this->missingCond()
+            );
+            $missing = Syncrosevi::groupMissing($lines);
             fputcsv($output, array(
                 $order['id_mother_order'],
                 $order['reference'],
@@ -805,14 +988,45 @@ class AdminSyncroseviController extends ModuleAdminController
                 $order['customer_name'],
                 $order['customer_email'],
                 $order['original_orders'],
+                implode(', ', $this->idList($order['original_ids'])),
                 (int) $order['total_products'],
                 number_format((float) $order['total_paid'], 2, ',', '.'),
                 $order['date_processed'] ? date('d/m/Y H:i', strtotime($order['date_processed'])) : '',
+                (int) $order['missing_count'],
+                (int) $order['missing_qty'],
+                $this->missingCsv($missing),
+            ), ';');
+        }
+
+        // Lotes sin pedido madre (ninguna referencia existía en la madre)
+        foreach ($this->getOrphanBatches(1000) as $batch) {
+            $qty = 0;
+            foreach ($batch['missing'] as $m) {
+                $qty += (int) $m['quantity'];
+            }
+            fputcsv($output, array(
+                '', 'SIN PEDIDO MADRE', $batch['shop_name'], '', '',
+                count($batch['original_ids']),
+                implode(', ', $batch['original_ids']),
+                0, '', $batch['date_processed'],
+                count($batch['missing']), $qty,
+                $this->missingCsv($batch['missing']),
             ), ';');
         }
 
         fclose($output);
         exit;
+    }
+
+    /** Productos fuera en una celda del CSV: REF · nombre · N uds (pedidos #…) | … */
+    protected function missingCsv(array $missing)
+    {
+        $parts = array();
+        foreach ($missing as $m) {
+            $parts[] = ltrim(Syncrosevi::missingLine($m), '- ');
+        }
+
+        return implode(' | ', $parts);
     }
 
     // PROCESAMIENTO DE FORMULARIOS
@@ -1117,6 +1331,9 @@ class AdminSyncroseviController extends ModuleAdminController
                         $this->confirmations[] = $result['shop'] . ': Pedido #' . $result['order_id'] . ' creado con ' . $result['products_count'] . ' productos (' . $result['orders_count'] . ' pedidos de la tienda hija)';
                     } else {
                         $this->confirmations[] = $result['shop'] . ': ' . $result['message'];
+                    }
+                    if (!empty($result['missing_count'])) {
+                        $this->warnings[] = sprintf($this->t('%s: %d referencias se quedaron fuera porque no existen en la tienda madre (míralas en Pedidos procesados).'), $result['shop'], (int) $result['missing_count']);
                     }
                 } else {
                     $this->errors[] = $result['shop'] . ': Error - ' . $result['message'];

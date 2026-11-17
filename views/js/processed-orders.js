@@ -14,7 +14,8 @@ var ProcessedOrders = {
         shop: '',
         dateFrom: '',
         dateTo: '',
-        search: ''
+        search: '',
+        onlyMissing: ''
     },
     
     /**
@@ -53,6 +54,12 @@ var ProcessedOrders = {
             self.loadProcessedOrders();
         });
         
+        $('#filter-missing').on('change', function() {
+            self.filters.onlyMissing = $(this).is(':checked') ? '1' : '';
+            self.currentPage = 1;
+            self.loadProcessedOrders();
+        });
+
         $('#filter-search').on('keyup input', this.debounce(function() {
             self.filters.search = $(this).val();
             self.currentPage = 1;
@@ -93,6 +100,7 @@ var ProcessedOrders = {
             dateFrom: this.filters.dateFrom,
             dateTo: this.filters.dateTo,
             search: this.filters.search,
+            onlyMissing: this.filters.onlyMissing,
             token: this.token
         };
         
@@ -106,6 +114,7 @@ var ProcessedOrders = {
                 if (response.success && response.orders) {
                     self.renderOrdersTable(response.orders);
                     self.updatePagination(response.total || response.orders.length);
+                    self.renderOrphans(response.orphans || []);
                     self.updateStats(response.stats);
                 } else {
                     self.showError('Error al cargar pedidos: ' + (response.message || 'Error desconocido'));
@@ -134,7 +143,7 @@ var ProcessedOrders = {
         tableBody.empty();
         
         if (orders.length === 0) {
-            var noDataRow = '<tr><td colspan="9" class="text-center text-muted">' +
+            var noDataRow = '<tr><td colspan="10" class="text-center text-muted">' +
                            '<i class="icon-info-circle"></i> No se encontraron pedidos con los filtros aplicados' +
                            '</td></tr>';
             tableBody.html(noDataRow);
@@ -149,10 +158,11 @@ var ProcessedOrders = {
                      '<td>' + this.esc(order.reference) + '</td>' +
                      '<td>' + this.esc(order.shop_name) + '</td>' +
                      '<td>' + this.esc(order.customer_name) + '<br><small class="text-muted">' + this.esc(order.customer_email) + '</small></td>' +
-                     '<td><span class="badge badge-info">' + order.original_orders + '</span></td>' +
+                     '<td>' + this.idsCell(order.original_ids, order.original_orders) + '</td>' +
                      '<td><span class="badge badge-warning">' + order.total_products + '</span></td>' +
+                     '<td>' + this.missingCell(order) + '</td>' +
                      '<td><strong>' + order.total_paid + '€</strong></td>' +
-                     '<td>' + this.formatDate(order.date_processed) + '</td>' +
+                     '<td style="white-space:nowrap">' + this.esc(order.date_processed) + '</td>' +
                      '<td>' +
                      '<div class="btn-group">' +
                      '<button type="button" class="btn btn-xs btn-info" onclick="ProcessedOrders.viewOrderDetails(' + order.id_mother_order + ')" title="Ver detalles">' +
@@ -170,6 +180,62 @@ var ProcessedOrders = {
         $('#orders-table-container').show();
     },
     
+    /** Pedidos de la hija: los primeros números y «+N» si hay más */
+    idsCell: function(ids, count) {
+        ids = ids || [];
+        if (!ids.length) {
+            return '<span class="badge badge-info">' + (parseInt(count, 10) || 0) + '</span>';
+        }
+        var shown = ids.slice(0, 5).map(function(id) { return '#' + id; }).join(', ');
+        var more = ids.length > 5 ? ' <span class="text-muted" title="' + this.esc(ids.map(function(id) { return '#' + id; }).join(', ')) + '">+' + (ids.length - 5) + '</span>' : '';
+        return '<small>' + shown + '</small>' + more;
+    },
+
+    /** Columna «Fuera» */
+    missingCell: function(order) {
+        if (order.missing_count > 0) {
+            return '<a href="#" class="label label-danger" onclick="ProcessedOrders.viewOrderDetails(' + parseInt(order.id_mother_order, 10) + '); return false;" title="' + order.missing_qty + ' uds en total">' +
+                   order.missing_count + ' ref.</a>';
+        }
+        if (order.legacy_lines > 0) {
+            return '<span class="text-muted" title="Pedido anterior a la versión 1.4.0: no se guardó qué productos se quedaron fuera">—</span>';
+        }
+        return '<span class="text-success"><i class="icon-check"></i></span>';
+    },
+
+    /** Lista de productos fuera (agrupados por referencia) */
+    missingList: function(missing) {
+        var self = this;
+        var html = '<ul class="list-unstyled" style="margin:0">';
+        missing.forEach(function(m) {
+            html += '<li><code>' + (m.reference ? self.esc(m.reference) : 'SIN REFERENCIA') + '</code> · ' + self.esc(m.name) +
+                    ' · <strong>' + parseInt(m.quantity, 10) + ' uds</strong>' +
+                    ' <small class="text-muted">(' + (m.orders.length > 1 ? 'pedidos' : 'pedido') + ' #' + m.orders.join(', #') + ')</small></li>';
+        });
+        return html + '</ul>';
+    },
+
+    /** Lotes sin pedido madre */
+    renderOrphans: function(orphans) {
+        var self = this;
+        var body = $('#orphans-table tbody');
+        body.empty();
+        if (!orphans.length) {
+            $('#orphans-container').hide();
+            return;
+        }
+        orphans.forEach(function(b) {
+            body.append('<tr>' +
+                '<td style="white-space:nowrap">' + self.esc(b.date_processed) + '</td>' +
+                '<td>' + self.esc(b.shop_name) + '</td>' +
+                '<td><small>#' + b.original_ids.join(', #') + '</small></td>' +
+                '<td>' + (b.legacy ? '<small class="text-muted">Anterior a la 1.4.0: líneas del lote</small>' : '') + self.missingList(b.missing) + '</td>' +
+                '</tr>');
+        });
+        $('#orphans-count').text(orphans.length);
+        $('#orphans-container').show();
+    },
+
     /**
      * Actualizar paginación
      */
@@ -283,7 +349,7 @@ var ProcessedOrders = {
         content += '<tr><td><strong>Referencia:</strong></td><td>' + order.reference + '</td></tr>';
         content += '<tr><td><strong>Estado:</strong></td><td><span class="badge badge-default">' + order.state_name + '</span></td></tr>';
         content += '<tr><td><strong>Total:</strong></td><td><strong>' + order.total_paid + '</strong></td></tr>';
-        content += '<tr><td><strong>Fecha:</strong></td><td>' + this.formatDate(order.date_add) + '</td></tr>';
+        content += '<tr><td><strong>Fecha:</strong></td><td>' + this.esc(order.date_add) + '</td></tr>';
         content += '</table>';
         content += '</div>';
         
@@ -308,9 +374,9 @@ var ProcessedOrders = {
             content += '<h5><i class="icon-refresh"></i> Información de Sincronización</h5>';
             content += '<table class="table table-condensed">';
             content += '<tr><td><strong>Tienda Origen:</strong></td><td>' + order.sync_info.shop_name + '</td></tr>';
-            content += '<tr><td><strong>Pedidos Originales:</strong></td><td><span class="badge badge-info">' + order.sync_info.original_orders + '</span>' + (order.sync_info.original_ids ? ' <small class="text-muted">#' + this.esc(order.sync_info.original_ids) + '</small>' : '') + '</td></tr>';
-            content += '<tr><td><strong>Fecha Sincronización:</strong></td><td>' + this.formatDate(order.sync_info.date_sync) + '</td></tr>';
-            content += '<tr><td><strong>Fecha Procesamiento:</strong></td><td>' + this.formatDate(order.sync_info.date_processed) + '</td></tr>';
+            content += '<tr><td><strong>Pedidos Originales:</strong></td><td><span class="badge badge-info">' + order.sync_info.original_orders + '</span>' + (order.sync_info.original_labels ? ' <small class="text-muted">' + this.esc(order.sync_info.original_labels) + '</small>' : '') + '</td></tr>';
+            content += '<tr><td><strong>Fecha Sincronización:</strong></td><td>' + this.esc(order.sync_info.date_sync) + '</td></tr>';
+            content += '<tr><td><strong>Fecha Procesamiento:</strong></td><td>' + this.esc(order.sync_info.date_processed) + '</td></tr>';
             content += '</table>';
             content += '</div></div>';
         }
@@ -339,6 +405,20 @@ var ProcessedOrders = {
             content += '</div></div>';
         }
         
+        // Productos que se quedaron fuera
+        content += '<div class="row"><div class="col-md-12">';
+        if (order.missing && order.missing.length > 0) {
+            content += '<div class="alert alert-danger" style="margin-bottom:0">';
+            content += '<h5 style="margin-top:0"><i class="icon-warning-sign"></i> No importados (' + order.missing.length + '): la referencia no existe en la tienda madre</h5>';
+            content += this.missingList(order.missing);
+            content += '</div>';
+        } else if (order.legacy) {
+            content += '<p class="text-muted"><i class="icon-info-circle"></i> Pedido anterior a la versión 1.4.0: no se guardó qué productos se quedaron fuera.</p>';
+        } else {
+            content += '<p class="text-success"><i class="icon-check"></i> Entraron todos los productos.</p>';
+        }
+        content += '</div></div>';
+        
         $('#orderDetailsContent').html(content);
     },
     
@@ -350,13 +430,15 @@ var ProcessedOrders = {
             shop: '',
             dateFrom: '',
             dateTo: '',
-            search: ''
+            search: '',
+            onlyMissing: ''
         };
         
         $('#filter-shop').val('');
         $('#filter-date-from').val('');
         $('#filter-date-to').val('');
         $('#filter-search').val('');
+        $('#filter-missing').prop('checked', false);
         
         this.currentPage = 1;
         this.loadProcessedOrders();
@@ -372,6 +454,7 @@ var ProcessedOrders = {
             dateFrom: this.filters.dateFrom,
             dateTo: this.filters.dateTo,
             search: this.filters.search,
+            onlyMissing: this.filters.onlyMissing,
             token: this.token
         };
         
@@ -393,14 +476,9 @@ var ProcessedOrders = {
      */
     formatDate: function(dateString) {
         if (!dateString) return '';
-        var date = new Date(dateString);
-        return date.toLocaleDateString('es-ES', {
-            day: '2-digit',
-            month: '2-digit',
-            year: 'numeric',
-            hour: '2-digit',
-            minute: '2-digit'
-        });
+        var m = /^(\d{4})-(\d{2})-(\d{2})(?:[ T](\d{2}):(\d{2}))?/.exec(String(dateString));
+        if (!m) return String(dateString);
+        return m[3] + '/' + m[2] + '/' + m[1] + (m[4] ? ' ' + m[4] + ':' + m[5] : '');
     },
     
     esc: function(text) {
@@ -430,5 +508,4 @@ function viewOrderDetails(orderId) {
 
 // Inicialización cuando el DOM esté listo
 $(document).ready(function() {
-    console.log('ProcessedOrders JS cargado');
-});
+    });

@@ -19,6 +19,8 @@ if (!defined('_PS_VERSION_')) {
  * Modo «clonar»: cada pedido de la tienda hija se crea en la madre como un pedido propio,
  * con el mismo cliente, direcciones, líneas, precios, impuestos, descuentos y transporte.
  *
+ * Entra todo producto cuya referencia exista en la madre, esté activo o no y tenga stock o no
+ * (no se toca el stock: baja con el pedido como en cualquier venta).
  * El pedido se crea con el circuito normal de PrestaShop (stock, historial, hooks) y después
  * se copian literalmente los importes de la hija para que coincidan al céntimo.
  */
@@ -214,26 +216,27 @@ class SyncroSeviClone
         $shopObject = new Shop($cart->id_shop);
 
         try {
+            // Entra todo lo que coincida por referencia, esté como esté en la madre y sin tocar el stock
             foreach ($lines as $r) {
                 $f = $r['found'];
-                $this->module->ensureProductStock($f['id_product'], $f['id_product_attribute'], (int) $r['product_quantity']);
                 $this->cartPrice($cart, $f['id_product'], $f['id_product_attribute'], (float) $r['unit_price_tax_excl']);
-                $res = $cart->updateQty((int) $r['product_quantity'], $f['id_product'], $f['id_product_attribute'], false, 'up', $cart->id_address_delivery, $shopObject, false);
-                if (!$res || $res < 0) {
-                    throw new Exception('No se pudo añadir «' . $r['product_reference'] . '» al carrito (cantidad mínima o producto no disponible)', self::ERR_HOLD);
+                if (!$this->module->addToCartAnyway($cart, $f['id_product'], $f['id_product_attribute'], (int) $r['product_quantity'], $shopObject, $r['product_reference'])) {
+                    throw new Exception('No se pudo añadir «' . $r['product_reference'] . '» al carrito: falló la escritura en la base de datos');
                 }
             }
 
             $subStockBefore = null;
             if ($missing) {
                 $subStockBefore = (int) StockAvailable::getQuantityAvailableByProduct($sub['id_product'], $sub['id_product_attribute']);
-                $this->module->ensureProductStock($sub['id_product'], $sub['id_product_attribute'], 1);
                 $this->cartPrice($cart, $sub['id_product'], $sub['id_product_attribute'], array_sum(array_column($missing, 'total_price_tax_excl')));
-                $res = $cart->updateQty(1, $sub['id_product'], $sub['id_product_attribute'], false, 'up', $cart->id_address_delivery, $shopObject, false);
-                if (!$res || $res < 0) {
-                    throw new Exception('No se pudo añadir el producto de sustitución al carrito', self::ERR_HOLD);
+                if (!$this->module->addToCartAnyway($cart, $sub['id_product'], $sub['id_product_attribute'], 1, $shopObject, 'sustitución')) {
+                    throw new Exception('No se pudo añadir el producto de sustitución al carrito: falló la escritura en la base de datos');
                 }
             }
+
+            // Carrito recargado: algunas líneas pueden haberse metido directamente en la base de datos
+            $cart = new Cart((int) $cart->id);
+            $context->cart = $cart;
 
             $cart->setDeliveryOption(array($cart->id_address_delivery => $carrierId . ','));
             $cart->update();
@@ -241,6 +244,8 @@ class SyncroSeviClone
             // Estado inicial: siempre el configurado en la tienda («Estado del Pedido»)
             $state = (int) $this->shop['id_order_state'] ?: $this->mappedState((int) $o->current_state);
             $idOrder = $this->validate($cart, $state, $ref);
+            // Si PrestaShop lo pasa a «En espera de reposición» por stock, vuelve al estado configurado
+            $this->module->keepOrderState($idOrder, $state);
 
             $this->copyAmounts($idOrder, $o, $lines, $missing, $sub, $carrierId);
 
@@ -271,6 +276,7 @@ class SyncroSeviClone
             'child_state' => (int) $o->current_state,
             'id_customer' => (int) $customer->id,
             'note' => $note,
+            'missing' => $missing,
         );
     }
 

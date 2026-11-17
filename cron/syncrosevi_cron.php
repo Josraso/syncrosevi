@@ -150,7 +150,8 @@ class SyncroSeviCron
                 if ($result['status'] == 'success') {
                     $totalProcessed++;
                     if (isset($result['order_id'])) {
-                        $this->log("✓ " . $result['shop'] . ": Pedido #{$result['order_id']} creado con {$result['products_count']} productos");
+                        $this->log("✓ " . $result['shop'] . ": Pedido #{$result['order_id']} creado con {$result['products_count']} productos"
+                            . (!empty($result['missing_count']) ? " ({$result['missing_count']} referencias fuera)" : ''));
                     } else {
                         $this->log("✓ " . $result['shop'] . ": " . ($result['message'] ?: 'Procesado correctamente'));
                     }

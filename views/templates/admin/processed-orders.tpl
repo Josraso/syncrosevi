@@ -17,9 +17,9 @@
             <div class="row" style="margin-bottom: 15px;">
                 <div class="col-md-3">
                     <label for="filter-search">Buscar</label>
-                    <input type="text" id="filter-search" class="form-control" placeholder="Referencia, nº de pedido, cliente...">
+                    <input type="text" id="filter-search" class="form-control" placeholder="Nº o referencia de pedido (madre o hija), cliente, referencia de producto...">
                 </div>
-                <div class="col-md-3">
+                <div class="col-md-2">
                     <label for="filter-shop">Tienda origen</label>
                     <select id="filter-shop" class="form-control">
                         <option value="">Todas</option>
@@ -36,7 +36,10 @@
                     <label for="filter-date-to">Hasta</label>
                     <input type="date" id="filter-date-to" class="form-control">
                 </div>
-                <div class="col-md-2" style="padding-top: 22px;">
+                <div class="col-md-3">
+                    <div class="checkbox" style="margin: 0 0 4px;">
+                        <label><input type="checkbox" id="filter-missing" value="1"> Solo con productos fuera</label>
+                    </div>
                     <div class="btn-group">
                         <button type="button" id="clear-filters" class="btn btn-default" title="Limpiar filtros"><i class="icon-eraser"></i></button>
                         <button type="button" id="refresh-orders" class="btn btn-default" title="Actualizar"><i class="icon-refresh"></i></button>
@@ -68,6 +71,7 @@
                                 <th>Cliente</th>
                                 <th>Pedidos Orig.</th>
                                 <th>Productos</th>
+                                <th title="Productos que no entraron porque su referencia no existe en la tienda madre">Fuera</th>
                                 <th>Total</th>
                                 <th>Fecha</th>
                                 <th>Acciones</th>
@@ -80,6 +84,24 @@
 
                 <div id="pagination-container"></div>
                 <div id="pagination-info" class="text-muted"></div>
+
+                <div id="orphans-container" style="display: none; margin-top: 20px;">
+                    <h4><i class="icon-warning-sign"></i> Lotes sin pedido madre <span class="badge" id="orphans-count"></span></h4>
+                    <p class="help-block">Pedidos de la tienda hija en los que no coincidió ninguna referencia con la tienda madre, así que no se creó pedido.</p>
+                    <div class="table-responsive">
+                        <table id="orphans-table" class="table table-striped table-condensed">
+                            <thead>
+                                <tr>
+                                    <th>Fecha</th>
+                                    <th>Tienda Origen</th>
+                                    <th>Pedidos de la hija</th>
+                                    <th>Productos fuera</th>
+                                </tr>
+                            </thead>
+                            <tbody></tbody>
+                        </table>
+                    </div>
+                </div>
             </div>
 
         </div>
@@ -92,7 +114,7 @@
         <div class="modal-content">
             <div class="modal-header">
                 <button type="button" class="close" data-dismiss="modal">&times;</button>
-                <h4 class="modal-title"><i class="icon-eye"></i> Detalle del pedido consolidado</h4>
+                <h4 class="modal-title"><i class="icon-eye"></i> Detalle del pedido</h4>
             </div>
             <div class="modal-body" id="orderDetailsContent"></div>
             <div class="modal-footer">

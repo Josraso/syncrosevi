@@ -22,6 +22,15 @@ class Syncrosevi extends Module
     /** Código de excepción: el lote no tiene ningún producto que exista en la tienda madre */
     const ERR_NO_PRODUCTS = 4201;
 
+    /** Estado de cada línea de la tienda hija (columna import_status) */
+    const LINE_PENDING = 0;
+    const LINE_IMPORTED = 1;
+    const LINE_NOT_FOUND = 2;
+    const LINE_NO_REFERENCE = 3;
+
+    /** Tope del mensaje del pedido (en 1.6/1.7 el mensaje admite 1600 caracteres) */
+    const MESSAGE_MAX = 1500;
+
     /** Tamaño máximo del log antes de rotarlo (5 MB) */
     const LOG_MAX_SIZE = 5242880;
 
@@ -39,8 +48,8 @@ class Syncrosevi extends Module
     {
         $this->name = 'syncrosevi';
         $this->tab = 'administration';
-        $this->version = '1.3.3';
-        $this->author = 'SyncroSevi Team';
+        $this->version = '1.4.0';
+        $this->author = 'josra';
         $this->need_instance = 0;
         $this->ps_versions_compliancy = array(
             'min' => '1.7.0.0',
@@ -447,6 +456,7 @@ class Syncrosevi extends Module
             `id_original_order` int(11) NOT NULL,
             `id_child_shop` int(11) NOT NULL,
             `id_mother_order` int(11) NULL DEFAULT NULL,
+            `child_reference` varchar(32) NOT NULL DEFAULT "",
             `processed` tinyint(1) NOT NULL DEFAULT 0,
             `realtime_sync` tinyint(1) NOT NULL DEFAULT 0,
             `date_sync` datetime NOT NULL,
@@ -456,6 +466,7 @@ class Syncrosevi extends Module
             UNIQUE KEY `unique_order_shop` (`id_original_order`, `id_child_shop`),
             KEY `idx_shop_order` (`id_child_shop`, `id_original_order`),
             KEY `idx_processed` (`processed`),
+            KEY `idx_mother` (`id_mother_order`),
             KEY `idx_realtime` (`realtime_sync`)
         ) ENGINE=' . _MYSQL_ENGINE_ . ' DEFAULT CHARSET=utf8;';
 
@@ -469,6 +480,7 @@ class Syncrosevi extends Module
             `product_reference` varchar(255) NOT NULL,
             `product_name` varchar(255) NOT NULL,
             `processed` tinyint(1) NOT NULL DEFAULT 0,
+            `import_status` tinyint(1) NOT NULL DEFAULT 0,
             `date_add` datetime NOT NULL,
             PRIMARY KEY (`id_line`),
             KEY `idx_child_shop_processed` (`id_child_shop`, `processed`),
@@ -551,6 +563,15 @@ class Syncrosevi extends Module
                 $db->execute('ALTER TABLE `' . _DB_PREFIX_ . 'syncrosevi_order_tracking` ADD COLUMN `' . $name . '` ' . $definition);
             }
         }
+        // 1.4.0: referencia del pedido de la hija (para buscarlo) y estado de cada línea (importada / fuera)
+        if (!in_array('child_reference', $trackingColumns)) {
+            $db->execute('ALTER TABLE `' . _DB_PREFIX_ . 'syncrosevi_order_tracking` ADD COLUMN `child_reference` varchar(32) NOT NULL DEFAULT "" AFTER `id_mother_order`');
+        }
+        $lineColumns = array_column((array) $db->executeS('SHOW COLUMNS FROM `' . _DB_PREFIX_ . 'syncrosevi_order_lines`'), 'Field');
+        if (!in_array('import_status', $lineColumns)) {
+            $db->execute('ALTER TABLE `' . _DB_PREFIX_ . 'syncrosevi_order_lines` ADD COLUMN `import_status` tinyint(1) NOT NULL DEFAULT 0 AFTER `processed`');
+        }
+
         $db->execute('CREATE TABLE IF NOT EXISTS `' . _DB_PREFIX_ . 'syncrosevi_clone_customer` (
             `id_customer` int(11) NOT NULL,
             `id_child_shop` int(11) NOT NULL DEFAULT 0,
@@ -562,6 +583,9 @@ class Syncrosevi extends Module
         $indexes = array_column((array) $db->executeS('SHOW INDEX FROM `' . _DB_PREFIX_ . 'syncrosevi_order_tracking`'), 'Key_name');
         if (!in_array('idx_shop_order', $indexes)) {
             $db->execute('ALTER TABLE `' . _DB_PREFIX_ . 'syncrosevi_order_tracking` ADD INDEX `idx_shop_order` (`id_child_shop`, `id_original_order`)');
+        }
+        if (!in_array('idx_mother', $indexes)) {
+            $db->execute('ALTER TABLE `' . _DB_PREFIX_ . 'syncrosevi_order_tracking` ADD INDEX `idx_mother` (`id_mother_order`)');
         }
 
         return true;
@@ -641,6 +665,7 @@ class Syncrosevi extends Module
         $db->insert('syncrosevi_order_tracking', array(
             'id_original_order' => (int) $order['id'],
             'id_child_shop' => (int) $shop['id_child_shop'],
+            'child_reference' => pSQL(Tools::substr(isset($order['reference']) ? (string) $order['reference'] : '', 0, 32)),
             'processed' => 0,
             'date_sync' => $now,
         ), false, true, Db::INSERT_IGNORE);
@@ -743,8 +768,10 @@ class Syncrosevi extends Module
     /**
      * Procesar pedidos pendientes - CREA UN SOLO PEDIDO CONSOLIDADO POR TIENDA
      *
+     * Entra todo producto cuya referencia exista en la madre, esté activo o no y tenga stock o no
+     * (no se toca el stock). Solo se queda fuera lo que no coincide, y queda apuntado línea a línea.
      * Solo se marcan como procesados los pedidos del lote cuando el pedido madre se crea bien
-     * (o cuando ninguno de sus productos existe en la tienda madre). Si falla, quedan pendientes
+     * (o cuando ninguna de sus referencias existe en la tienda madre). Si falla, quedan pendientes
      * para el siguiente intento y el error se devuelve en el resultado.
      *
      * @param int $limit número máximo de pedidos por tienda (null = configuración)
@@ -797,43 +824,74 @@ class Syncrosevi extends Module
 
                 $this->log('Procesando lote de ' . count($orderIds) . ' pedidos de ' . $shop['name'] . ' (#' . implode(', #', $orderIds) . ')');
 
-                // Agrupar productos y sumar cantidades
+                // Entra todo lo que coincida por referencia (esté como esté en la madre); fuera solo lo que no coincide
                 $products = array();
+                $missingLines = array();
+                $lineStatus = array();
                 foreach ($pendingLines as $line) {
-                    $key = $line['id_product'] . '_' . $line['id_product_attribute'] . '_' . $line['product_reference'];
+                    $reference = trim((string) $line['product_reference']);
+                    $found = $reference !== '' ? $this->findProductByReference($reference) : null;
+                    if (!$found) {
+                        $lineStatus[(int) $line['id_line']] = $reference === '' ? self::LINE_NO_REFERENCE : self::LINE_NOT_FOUND;
+                        $missingLines[] = $line;
+                        $this->log('✗ Fuera: pedido #' . (int) $line['id_original_order'] . ' de ' . $shop['name'] . ' · '
+                            . ($reference !== '' ? 'referencia "' . $reference . '" (no existe en la madre)' : 'línea sin referencia')
+                            . ' · «' . $line['product_name'] . '» · ' . (int) $line['quantity'] . ' uds');
+                        continue;
+                    }
+                    $lineStatus[(int) $line['id_line']] = self::LINE_IMPORTED;
+                    // Se agrupan por producto de la madre y se suman las cantidades
+                    $key = (int) $found['id_product'] . '_' . (int) $found['id_product_attribute'];
                     if (isset($products[$key])) {
                         $products[$key]['quantity'] += (int) $line['quantity'];
                     } else {
-                        $products[$key] = $line;
+                        $products[$key] = array(
+                            'id_product' => (int) $found['id_product'],
+                            'id_product_attribute' => (int) $found['id_product_attribute'],
+                            'quantity' => (int) $line['quantity'],
+                            'reference' => $reference,
+                        );
                     }
                 }
+                $missing = self::groupMissing($missingLines);
 
                 $orderId = null;
                 $validProducts = 0;
                 $noProducts = false;
 
-                $db->execute('START TRANSACTION');
-                try {
-                    $customer = $this->validateCustomer($shop['id_customer']);
-                    $address = $this->validateAddress($shop['id_address'], $customer->id);
-                    $created = $this->createMotherOrder($products, $shop, $customer, $address);
-                    $orderId = $created['id_order'];
-                    $validProducts = $created['products'];
-                    $this->markBatchProcessed($idShop, $inIds, $orderId);
-                    $db->execute('COMMIT');
-                } catch (Exception $e) {
-                    $db->execute('ROLLBACK');
-                    if ($e->getCode() != self::ERR_NO_PRODUCTS) {
-                        throw $e;
-                    }
-                    // Ningún producto existe en la madre: se marcan como procesados sin crear pedido
+                if (!$products) {
+                    // Ninguna referencia coincide: se marcan como procesados sin pedido (y quedan a la vista como «fuera»)
                     $noProducts = true;
-                    $this->markBatchProcessed($idShop, $inIds, 0);
-                    $this->log('Lote de ' . $shop['name'] . ' marcado como procesado sin pedido: ' . $e->getMessage());
-                } catch (Throwable $e) {
-                    // Errores fatales de PHP 7+ (TypeError...): se deshace todo y los pedidos siguen pendientes
-                    $db->execute('ROLLBACK');
-                    throw new Exception($e->getMessage() . ' (' . basename($e->getFile()) . ':' . $e->getLine() . ')');
+                    $this->markBatchProcessed($idShop, $inIds, 0, $lineStatus);
+                    $this->log('Lote de ' . $shop['name'] . ' (#' . implode(', #', $orderIds) . ') procesado sin pedido: ninguna referencia existe en la madre (' . self::missingSummary($missing) . ')');
+                } else {
+                    $db->execute('START TRANSACTION');
+                    try {
+                        $customer = $this->validateCustomer($shop['id_customer']);
+                        $address = $this->validateAddress($shop['id_address'], $customer->id);
+                        $created = $this->createMotherOrder($products, $shop, $customer, $address, $missing);
+                        $orderId = $created['id_order'];
+                        $validProducts = $created['products'];
+                        $this->markBatchProcessed($idShop, $inIds, $orderId, $lineStatus);
+                        $db->execute('COMMIT');
+                    } catch (Exception $e) {
+                        $db->execute('ROLLBACK');
+                        if ($e->getCode() != self::ERR_NO_PRODUCTS) {
+                            throw $e;
+                        }
+                        // Carrito con total 0: como hasta ahora, se marca procesado sin pedido
+                        $noProducts = true;
+                        $this->markBatchProcessed($idShop, $inIds, 0, $lineStatus);
+                        $this->log('Lote de ' . $shop['name'] . ' marcado como procesado sin pedido: ' . $e->getMessage());
+                    } catch (Throwable $e) {
+                        // Errores fatales de PHP 7+ (TypeError...): se deshace todo y los pedidos siguen pendientes
+                        $db->execute('ROLLBACK');
+                        throw new Exception($e->getMessage() . ' (' . basename($e->getFile()) . ':' . $e->getLine() . ')');
+                    }
+                    if ($orderId) {
+                        $this->log('Lote de ' . $shop['name'] . ' (#' . implode(', #', $orderIds) . ') → pedido madre #' . $orderId . ': '
+                            . $validProducts . ' productos' . ($missing ? ', ' . count($missing) . ' fuera (' . self::missingSummary($missing) . ')' : ', ninguno fuera'));
+                    }
                 }
 
                 if ($orderId) {
@@ -842,6 +900,7 @@ class Syncrosevi extends Module
                         'order_id' => $orderId,
                         'products_count' => $validProducts,
                         'orders_count' => count($orderIds),
+                        'missing_count' => count($missing),
                         'status' => 'success',
                     );
                 } elseif ($noProducts) {
@@ -849,7 +908,8 @@ class Syncrosevi extends Module
                         'shop' => $shop['name'],
                         'status' => 'success',
                         'orders_count' => count($orderIds),
-                        'message' => 'Procesado sin crear pedido (ningún producto encontrado en la tienda madre)',
+                        'missing_count' => count($missing),
+                        'message' => $products ? 'Procesado sin crear pedido (el carrito daba 0 €)' : 'Procesado sin crear pedido (ninguna referencia existe en la tienda madre)',
                     );
                 }
             } catch (Exception $e) {
@@ -889,10 +949,11 @@ class Syncrosevi extends Module
         }
     }
 
-    /** Marca como procesadas las líneas y el tracking de los pedidos del lote (y solo esos) */
-    private function markBatchProcessed($idShop, $inIds, $motherOrderId)
+    /** Marca como procesadas las líneas y el tracking de los pedidos del lote (y solo esos), con el estado de cada línea */
+    private function markBatchProcessed($idShop, $inIds, $motherOrderId, array $lineStatus = array())
     {
         $db = Db::getInstance();
+        $this->saveLineStatus($lineStatus);
         $db->execute(
             'UPDATE `' . _DB_PREFIX_ . 'syncrosevi_order_lines`
              SET processed = 1
@@ -907,6 +968,193 @@ class Syncrosevi extends Module
              WHERE id_child_shop = ' . (int) $idShop . ' AND processed = 0
              AND id_original_order IN (' . $inIds . ')'
         );
+    }
+
+    /** Guarda el estado de cada línea (id_line => estado) */
+    public function saveLineStatus(array $lineStatus)
+    {
+        $byStatus = array();
+        foreach ($lineStatus as $idLine => $status) {
+            $byStatus[(int) $status][] = (int) $idLine;
+        }
+        foreach ($byStatus as $status => $ids) {
+            foreach (array_chunk($ids, 500) as $chunk) {
+                Db::getInstance()->execute(
+                    'UPDATE `' . _DB_PREFIX_ . 'syncrosevi_order_lines` SET import_status = ' . (int) $status . '
+                     WHERE id_line IN (' . implode(',', $chunk) . ')'
+                );
+            }
+        }
+    }
+
+    /**
+     * Agrupa las líneas que se quedaron fuera por referencia (sin referencia: por nombre),
+     * sumando cantidades y juntando los pedidos de la hija.
+     *
+     * @param array $lines filas con product_reference, product_name, quantity, id_original_order
+     *
+     * @return array lista de array('reference', 'name', 'quantity', 'orders' => array(ids))
+     */
+    public static function groupMissing(array $lines)
+    {
+        $groups = array();
+        foreach ($lines as $line) {
+            $reference = trim((string) $line['product_reference']);
+            $name = trim((string) $line['product_name']);
+            $key = $reference !== '' ? 'r:' . Tools::strtolower($reference) : 'n:' . Tools::strtolower($name);
+            if (!isset($groups[$key])) {
+                $groups[$key] = array('reference' => $reference, 'name' => $name, 'quantity' => 0, 'orders' => array());
+            }
+            $groups[$key]['quantity'] += (int) $line['quantity'];
+            $groups[$key]['orders'][(int) $line['id_original_order']] = (int) $line['id_original_order'];
+        }
+        foreach ($groups as &$group) {
+            sort($group['orders']);
+            $group['orders'] = array_values($group['orders']);
+        }
+        unset($group);
+
+        return array_values($groups);
+    }
+
+    /** Resumen corto para el log: REF1 x6, REF2 x1… */
+    public static function missingSummary(array $missing)
+    {
+        $parts = array();
+        foreach ($missing as $m) {
+            $parts[] = ($m['reference'] !== '' ? $m['reference'] : 'sin referencia «' . $m['name'] . '»') . ' x' . (int) $m['quantity'];
+        }
+
+        return implode(', ', $parts);
+    }
+
+    /** Una línea de producto fuera para el mensaje del pedido */
+    public static function missingLine(array $m)
+    {
+        $clean = function ($text) {
+            return trim(preg_replace('/\s+/', ' ', str_replace(array('<', '>'), '', (string) $text)));
+        };
+        $orders = $m['orders'];
+        $label = count($orders) > 1 ? 'pedidos' : 'pedido';
+        if (count($orders) > 8) {
+            $ordersText = '#' . implode(', #', array_slice($orders, 0, 8)) . '… (' . count($orders) . ')';
+        } else {
+            $ordersText = '#' . implode(', #', $orders);
+        }
+
+        return '- ' . ($m['reference'] !== '' ? $clean($m['reference']) : 'SIN REFERENCIA') . ' · ' . Tools::substr($clean($m['name']), 0, 120)
+            . ' · ' . (int) $m['quantity'] . ' uds (' . $label . ' ' . $ordersText . ')';
+    }
+
+    /**
+     * Mensaje del pedido madre: título con la fecha en castellano y, debajo, los productos que se quedaron fuera.
+     * Con saltos de línea, y cortado para que el pedido se cree siempre (en 1.6/1.7 el mensaje tiene un tope).
+     */
+    public function buildOrderMessage($title, array $missing)
+    {
+        $text = $title;
+        if (!$missing) {
+            return $text;
+        }
+        $text .= "\nProductos no importados (la referencia no existe en la tienda madre):";
+        $more = function ($n) {
+            return "\n… y " . $n . ' más (ver Pedidos procesados en SyncroSevi)';
+        };
+        $count = count($missing);
+        foreach (array_values($missing) as $i => $m) {
+            $line = "\n" . self::missingLine($m);
+            $rest = $count - $i - 1;
+            $reserve = $rest > 0 ? Tools::strlen($more($rest)) : 0;
+            if (Tools::strlen($text . $line) + $reserve > self::MESSAGE_MAX) {
+                $text .= $more($rest + 1);
+                break;
+            }
+            $text .= $line;
+        }
+
+        return $text;
+    }
+
+    /** Fecha y hora actuales en formato castellano (dd/mm/aaaa hh:mm:ss) */
+    public static function spanishNow()
+    {
+        return date('d/m/Y H:i:s');
+    }
+
+    /**
+     * Mete un producto en el carrito aunque PrestaShop no lo deje (desactivado, no disponible para pedidos,
+     * sin stock, cantidad mínima, pack sin stock en sus componentes). No toca el stock: al crearse el pedido
+     * baja como en cualquier venta (y puede quedar en negativo).
+     *
+     * @return bool
+     */
+    public function addToCartAnyway(Cart $cart, $idProduct, $idAttribute, $quantity, Shop $shop, $reference = '')
+    {
+        $quantity = (int) $quantity;
+        if ($quantity <= 0) {
+            return true;
+        }
+
+        // 1. Lo normal de PrestaShop (en las versiones que lo admiten, sin mirar el stock)
+        $result = $cart->updateQty($quantity, (int) $idProduct, (int) $idAttribute, false, 'up', (int) $cart->id_address_delivery, $shop, false, true);
+        if ($result && $result > 0) {
+            $this->log('✓ "' . $reference . '" añadido (cantidad: ' . $quantity . ')', true);
+
+            return true;
+        }
+
+        // 2. PrestaShop no lo deja: la línea se mete directamente en el carrito
+        $db = Db::getInstance();
+        $hasCustomization = (bool) $db->executeS('SHOW COLUMNS FROM `' . _DB_PREFIX_ . 'cart_product` LIKE "id_customization"');
+        $where = 'id_cart = ' . (int) $cart->id . ' AND id_product = ' . (int) $idProduct . ' AND id_product_attribute = ' . (int) $idAttribute
+            . ($hasCustomization ? ' AND id_customization = 0' : '');
+        $current = (int) $db->getValue('SELECT SUM(quantity) FROM `' . _DB_PREFIX_ . 'cart_product` WHERE ' . $where);
+        if ($current > 0) {
+            $ok = $db->execute('UPDATE `' . _DB_PREFIX_ . 'cart_product` SET quantity = quantity + ' . $quantity . ' WHERE ' . $where . ' LIMIT 1');
+        } else {
+            $row = array(
+                'id_cart' => (int) $cart->id,
+                'id_product' => (int) $idProduct,
+                'id_product_attribute' => (int) $idAttribute,
+                // PrestaShop 9 guarda las líneas sin dirección de entrega
+                'id_address_delivery' => version_compare(_PS_VERSION_, '9.0.0', '>=') ? 0 : (int) $cart->id_address_delivery,
+                'id_shop' => (int) $shop->id,
+                'quantity' => $quantity,
+                'date_add' => date('Y-m-d H:i:s'),
+            );
+            if ($hasCustomization) {
+                $row['id_customization'] = 0;
+            }
+            $ok = $db->insert('cart_product', $row);
+        }
+        if ($ok) {
+            $this->log('✓ "' . $reference . '" añadido directamente (PrestaShop no lo dejaba: desactivado, no disponible, sin stock o cantidad mínima) (cantidad: ' . $quantity . ')', true);
+        }
+
+        return (bool) $ok;
+    }
+
+    /**
+     * Si PrestaShop ha cambiado el pedido a «En espera de reposición» (stock en negativo),
+     * lo vuelve al estado configurado para la tienda, sin correos.
+     */
+    public function keepOrderState($idOrder, $state)
+    {
+        $state = (int) $state;
+        if (!$state) {
+            return;
+        }
+        $order = new Order((int) $idOrder);
+        if (!Validate::isLoadedObject($order) || (int) $order->current_state === $state) {
+            return;
+        }
+        $previous = (int) $order->current_state;
+        $history = new OrderHistory();
+        $history->id_order = (int) $order->id;
+        $history->id_employee = 0;
+        $history->changeIdOrderState($state, $order, true);
+        $history->add();
+        $this->log('Pedido madre #' . (int) $order->id . ': PrestaShop lo pasó al estado ' . $previous . ' (en espera de reposición por stock); vuelto al estado configurado (' . $state . ')');
     }
 
     /**
@@ -1162,7 +1410,8 @@ class Syncrosevi extends Module
         $row = $db->getRow(
             'SELECT pa.id_product_attribute, pa.id_product FROM `' . _DB_PREFIX_ . 'product_attribute` pa
              JOIN `' . _DB_PREFIX_ . 'product` p ON pa.id_product = p.id_product
-             WHERE pa.reference = "' . $ref . '" AND p.active = 1'
+             WHERE pa.reference = "' . $ref . '"
+             ORDER BY p.active DESC, pa.id_product_attribute ASC'
         );
         if ($row) {
             $result = array('id_product' => (int) $row['id_product'], 'id_product_attribute' => (int) $row['id_product_attribute'], 'type' => 'combination', 'found_by' => 'combination_reference');
@@ -1173,7 +1422,8 @@ class Syncrosevi extends Module
             $row = $db->getRow(
                 'SELECT pa.id_product_attribute, pa.id_product FROM `' . _DB_PREFIX_ . 'product_attribute` pa
                  JOIN `' . _DB_PREFIX_ . 'product` p ON pa.id_product = p.id_product
-                 WHERE (pa.ean13 = "' . $ref . '" OR pa.upc = "' . $ref . '" OR pa.isbn = "' . $ref . '") AND p.active = 1'
+                 WHERE (pa.ean13 = "' . $ref . '" OR pa.upc = "' . $ref . '" OR pa.isbn = "' . $ref . '")
+             ORDER BY p.active DESC, pa.id_product_attribute ASC'
             );
             if ($row) {
                 $result = array('id_product' => (int) $row['id_product'], 'id_product_attribute' => (int) $row['id_product_attribute'], 'type' => 'combination', 'found_by' => 'combination_code');
@@ -1182,7 +1432,7 @@ class Syncrosevi extends Module
 
         // 3. Producto simple por referencia
         if (!$result) {
-            $id = (int) $db->getValue('SELECT id_product FROM `' . _DB_PREFIX_ . 'product` WHERE reference = "' . $ref . '" AND active = 1');
+            $id = (int) $db->getValue('SELECT id_product FROM `' . _DB_PREFIX_ . 'product` WHERE reference = "' . $ref . '" ORDER BY active DESC, id_product ASC');
             if ($id) {
                 $result = array('id_product' => $id, 'id_product_attribute' => 0, 'type' => 'simple', 'found_by' => 'product_reference');
             }
@@ -1192,7 +1442,8 @@ class Syncrosevi extends Module
         if (!$result) {
             $id = (int) $db->getValue(
                 'SELECT id_product FROM `' . _DB_PREFIX_ . 'product`
-                 WHERE (ean13 = "' . $ref . '" OR upc = "' . $ref . '" OR isbn = "' . $ref . '") AND active = 1'
+                 WHERE (ean13 = "' . $ref . '" OR upc = "' . $ref . '" OR isbn = "' . $ref . '")
+                 ORDER BY active DESC, id_product ASC'
             );
             if ($id) {
                 $result = array('id_product' => $id, 'id_product_attribute' => 0, 'type' => 'simple', 'found_by' => 'product_code');
@@ -1202,7 +1453,7 @@ class Syncrosevi extends Module
         if ($result) {
             $this->log('✓ "' . $reference . '" -> producto ' . $result['id_product'] . ' / combinación ' . $result['id_product_attribute'] . ' (' . $result['found_by'] . ')', true);
         } else {
-            $this->log('✗ Producto NO encontrado en la tienda madre: "' . $reference . '"');
+            $this->log('✗ Producto NO encontrado en la tienda madre: "' . $reference . '"', true);
         }
 
         $this->productCache[$reference] = $result;
@@ -1238,7 +1489,7 @@ class Syncrosevi extends Module
      *
      * @return array array('id_order' => int, 'products' => int)
      */
-    private function createMotherOrder($products, $shop, $customer = null, $address = null)
+    private function createMotherOrder($products, $shop, $customer = null, $address = null, array $missing = array())
     {
         if (!$customer) {
             $customer = $this->validateCustomer($shop['id_customer']);
@@ -1249,8 +1500,11 @@ class Syncrosevi extends Module
 
         $cart = $this->createSimpleCart($customer, $address, $shop);
         $validProducts = $this->addProductsToCart($cart, $products, $shop);
+        // Carrito recargado: algunas líneas pueden haberse metido directamente en la base de datos
+        $cart = new Cart((int) $cart->id);
+        Context::getContext()->cart = $cart;
         $this->configureCartShipping($cart, $shop);
-        $orderId = $this->createOrderFromCart($cart, $shop);
+        $orderId = $this->createOrderFromCart($cart, $shop, $missing);
 
         $this->log('✓ Pedido madre #' . $orderId . ' creado para ' . $shop['name'] . ' con ' . $validProducts . ' productos');
 
@@ -1287,12 +1541,13 @@ class Syncrosevi extends Module
     }
 
     /**
-     * Añadir productos al carrito (los que no existen en la madre se omiten)
+     * Añadir al carrito los productos ya encontrados en la madre (todos entran, sin tocar el stock)
+     *
+     * @param array $products array('id_product', 'id_product_attribute', 'quantity', 'reference')
      */
     private function addProductsToCart($cart, $products, $shop)
     {
         $addedCount = 0;
-        $notFoundCount = 0;
 
         $customer = new Customer($cart->id_customer);
         $context = Context::getContext();
@@ -1308,41 +1563,12 @@ class Syncrosevi extends Module
         }
 
         foreach ($products as $product) {
-            $reference = trim($product['product_reference']);
-            if ($reference === '') {
-                ++$notFoundCount;
-                $this->log('Línea sin referencia omitida: "' . $product['product_name'] . '"');
-                continue;
+            if (!$this->addToCartAnyway($cart, $product['id_product'], $product['id_product_attribute'], (int) $product['quantity'], $shopObject, $product['reference'])) {
+                throw new Exception('No se pudo añadir "' . $product['reference'] . '" (producto ' . (int) $product['id_product'] . ', combinación ' . (int) $product['id_product_attribute'] . ') al carrito: falló la escritura en la base de datos');
             }
+            ++$addedCount;
 
-            $productFound = $this->findProductByReference($reference);
-            if (!$productFound) {
-                ++$notFoundCount;
-                continue;
-            }
-
-            $this->ensureProductStock($productFound['id_product'], $productFound['id_product_attribute'], (int) $product['quantity']);
-
-            $result = $cart->updateQty(
-                (int) $product['quantity'],
-                $productFound['id_product'],
-                $productFound['id_product_attribute'],
-                false,
-                'up',
-                $cart->id_address_delivery,
-                $shopObject,
-                false
-            );
-
-            if ($result && $result > 0) {
-                ++$addedCount;
-                $this->log('✓ "' . $reference . '" añadido (cantidad: ' . $product['quantity'] . ')', true);
-            } else {
-                ++$notFoundCount;
-                $this->log('✗ No se pudo añadir "' . $reference . '" al carrito (cantidad mínima o producto no disponible)');
-            }
-
-            if ($addedCount > 0 && $addedCount % 10 == 0) {
+            if ($addedCount % 10 == 0) {
                 gc_collect_cycles();
             }
         }
@@ -1351,11 +1577,7 @@ class Syncrosevi extends Module
             @ini_set('memory_limit', $currentMemoryLimit);
         }
 
-        $this->log('RESUMEN carrito ' . $cart->id . ': ' . $addedCount . ' productos añadidos, ' . $notFoundCount . ' omitidos');
-
-        if ($addedCount === 0) {
-            throw new Exception('No se pudo añadir NINGÚN producto al carrito', self::ERR_NO_PRODUCTS);
-        }
+        $this->log('RESUMEN carrito ' . $cart->id . ': ' . $addedCount . ' productos añadidos', true);
 
         return $addedCount;
     }
@@ -1394,25 +1616,10 @@ class Syncrosevi extends Module
      * Asegurar que el producto se puede pedir: si no admite pedidos sin stock y falta stock,
      * se suma exactamente lo que falta (antes se sumaban 100 unidades de más que quedaban como stock ficticio).
      */
-    public function ensureProductStock($productId, $attributeId, $requiredQty)
-    {
-        $currentStock = (int) StockAvailable::getQuantityAvailableByProduct($productId, $attributeId);
-        if ($currentStock >= $requiredQty) {
-            return;
-        }
-        if (Product::isAvailableWhenOutOfStock(StockAvailable::outOfStock($productId))) {
-            return; // admite pedidos sin stock: no hace falta tocar nada
-        }
-
-        $neededStock = $requiredQty - $currentStock;
-        StockAvailable::updateQuantity($productId, $attributeId, $neededStock, Context::getContext()->shop->id);
-        $this->log('Stock ajustado para producto ' . $productId . ' (combinación ' . $attributeId . '): +' . $neededStock . ' unidades');
-    }
-
     /**
      * Crear pedido desde carrito usando el módulo de pago interno
      */
-    private function createOrderFromCart($cart, $shop)
+    private function createOrderFromCart($cart, $shop, array $missing = array())
     {
         $cartTotal = $cart->getOrderTotal(true);
 
@@ -1440,7 +1647,7 @@ class Syncrosevi extends Module
             (int) $shop['id_order_state'],
             $cartTotal,
             'SyncroSevi - ' . $shop['name'],
-            'Pedido consolidado de ' . $shop['name'] . ' - Fecha: ' . date('Y-m-d H:i:s'),
+            $this->buildOrderMessage('Pedido consolidado de ' . $shop['name'] . ' - Fecha: ' . self::spanishNow(), $missing),
             array(),
             (int) $cart->id_currency,
             false,
@@ -1448,6 +1655,8 @@ class Syncrosevi extends Module
         );
 
         if ($result && $paymentModule->currentOrder) {
+            $this->keepOrderState((int) $paymentModule->currentOrder, (int) $shop['id_order_state']);
+
             return (int) $paymentModule->currentOrder;
         }
 
@@ -1589,14 +1798,22 @@ class Syncrosevi extends Module
             ++self::$noPush;
             try {
                 $created = $clone->cloneOrder($childId);
-                $this->markCloneProcessed($idShop, $childId, $created['id_order'], $created['child_state']);
+                $this->markCloneProcessed($idShop, $childId, $created['id_order'], $created['child_state'], isset($created['missing']) ? $created['missing'] : array());
                 $db->execute('COMMIT');
                 $this->log('✓ Pedido #' . $childId . ' de ' . $shop['name'] . ' clonado como pedido #' . $created['id_order']);
+                foreach ((array) (isset($created['missing']) ? $created['missing'] : array()) as $m) {
+                    $this->log('✗ Fuera: pedido #' . $childId . ' de ' . $shop['name'] . ' · '
+                        . (trim($m['product_reference']) !== '' ? 'referencia "' . $m['product_reference'] . '" (no existe en la madre, pasó con el producto de sustitución)' : 'línea sin referencia')
+                        . ' · «' . $m['product_name'] . '» · ' . (int) $m['product_quantity'] . ' uds');
+                }
                 $results[] = array(
                     'shop' => $shop['name'],
                     'order_id' => $created['id_order'],
                     'products_count' => $created['products'],
                     'orders_count' => 1,
+                    'missing_count' => count(Syncrosevi::groupMissing(array_map(function ($m) use ($childId) {
+                        return array('product_reference' => $m['product_reference'], 'product_name' => $m['product_name'], 'quantity' => $m['product_quantity'], 'id_original_order' => $childId);
+                    }, isset($created['missing']) ? $created['missing'] : array()))),
                     'status' => 'success',
                 );
             } catch (Exception $e) {
@@ -1630,9 +1847,28 @@ class Syncrosevi extends Module
         );
     }
 
-    private function markCloneProcessed($idShop, $childId, $motherId, $childState)
+    private function markCloneProcessed($idShop, $childId, $motherId, $childState, array $missing = array())
     {
         $db = Db::getInstance();
+        // Estado de cada línea: importada, o fuera (pasó con el producto de sustitución) si su referencia no existe en la madre
+        $missingRefs = array();
+        foreach ($missing as $m) {
+            $missingRefs[Tools::strtolower(trim((string) $m['product_reference']))] = true;
+        }
+        $lineStatus = array();
+        $lines = (array) $db->executeS(
+            'SELECT id_line, product_reference FROM `' . _DB_PREFIX_ . 'syncrosevi_order_lines`
+             WHERE id_child_shop = ' . (int) $idShop . ' AND id_original_order = ' . (int) $childId . ' AND processed = 0'
+        );
+        foreach ($lines as $line) {
+            $ref = Tools::strtolower(trim((string) $line['product_reference']));
+            if (isset($missingRefs[$ref])) {
+                $lineStatus[(int) $line['id_line']] = $ref === '' ? self::LINE_NO_REFERENCE : self::LINE_NOT_FOUND;
+            } else {
+                $lineStatus[(int) $line['id_line']] = self::LINE_IMPORTED;
+            }
+        }
+        $this->saveLineStatus($lineStatus);
         $db->execute(
             'UPDATE `' . _DB_PREFIX_ . 'syncrosevi_order_lines` SET processed = 1
              WHERE id_child_shop = ' . (int) $idShop . ' AND id_original_order = ' . (int) $childId . ' AND processed = 0'
