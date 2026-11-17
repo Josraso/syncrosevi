@@ -1,5 +1,10 @@
 # Changelog — SyncroSevi
 
+## 1.4.1 — 2026-11-17
+- Pedidos procesados: los lotes sin pedido madre salen en una tabla igual que la de pedidos (tienda, pedidos de la hija, «Fuera», fecha) con el botón de ver detalle, en vez del resumen de texto.
+- La ventana de detalle muestra los no importados en una tabla (referencia, producto, unidades, pedidos de la hija).
+- Junto a cada referencia que no existe, pista con las referencias parecidas que sí hay en la madre (por ejemplo «41109B → en la madre hay 41109»), o «Nada parecido en la madre». Solo informa: no cambia lo que entra.
+
 ## 1.4.0 — 2026-11-17
 - Entra en la tienda madre **todo producto cuya referencia coincida**, aunque esté desactivado, no esté disponible para pedidos, no tenga stock, no llegue a la cantidad mínima o sea un pack sin stock en sus componentes. Vale para el modo consolidado y para el modo clon.
 - **Ya no se suma stock en la madre** para que quepa el pedido: el stock baja con el pedido como en cualquier venta (puede quedar en negativo).

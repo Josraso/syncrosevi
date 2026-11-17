@@ -203,37 +203,110 @@ var ProcessedOrders = {
         return '<span class="text-success"><i class="icon-check"></i></span>';
     },
 
-    /** Lista de productos fuera (agrupados por referencia) */
+    /** Lista de productos fuera (agrupados por referencia), con las referencias parecidas de la madre como pista */
     missingList: function(missing) {
         var self = this;
-        var html = '<ul class="list-unstyled" style="margin:0">';
+        var html = '<table class="table table-condensed" style="margin:0;background:transparent">';
+        html += '<thead><tr><th>Referencia</th><th>Producto</th><th class="text-center">Uds</th><th>Pedidos de la hija</th></tr></thead><tbody>';
         missing.forEach(function(m) {
-            html += '<li><code>' + (m.reference ? self.esc(m.reference) : 'SIN REFERENCIA') + '</code> · ' + self.esc(m.name) +
-                    ' · <strong>' + parseInt(m.quantity, 10) + ' uds</strong>' +
-                    ' <small class="text-muted">(' + (m.orders.length > 1 ? 'pedidos' : 'pedido') + ' #' + m.orders.join(', #') + ')</small></li>';
+            var hint = '';
+            if (m.reference && m.similar) {
+                if (m.similar.length) {
+                    hint = '<br><small class="text-muted"><i class="icon-lightbulb"></i> En la madre hay: ' + m.similar.map(function(x) {
+                        return '<code>' + self.esc(x.reference) + '</code>' + (x.name ? ' ' + self.esc(x.name) : '');
+                    }).join(' · ') + '</small>';
+                } else {
+                    hint = '<br><small class="text-muted">Nada parecido en la madre</small>';
+                }
+            }
+            html += '<tr>' +
+                '<td style="white-space:nowrap"><code>' + (m.reference ? self.esc(m.reference) : 'SIN REFERENCIA') + '</code></td>' +
+                '<td>' + self.esc(m.name) + hint + '</td>' +
+                '<td class="text-center"><strong>' + parseInt(m.quantity, 10) + '</strong></td>' +
+                '<td><small>#' + m.orders.join(', #') + '</small></td>' +
+                '</tr>';
         });
-        return html + '</ul>';
+        return html + '</tbody></table>';
     },
 
-    /** Lotes sin pedido madre */
+    /** Bloque «No importados» de la ventana de detalle */
+    missingBlock: function(missing, legacy) {
+        var content = '<div class="row"><div class="col-md-12">';
+        if (missing && missing.length > 0) {
+            content += '<div class="alert alert-danger" style="margin-bottom:0">';
+            content += '<h5 style="margin-top:0"><i class="icon-warning-sign"></i> No importados (' + missing.length + '): la referencia no existe en la tienda madre</h5>';
+            if (legacy) {
+                content += '<p><small>Lote anterior a la versión 1.4.0: se muestran todas sus líneas.</small></p>';
+            }
+            content += this.missingList(missing);
+            content += '</div>';
+        } else if (legacy) {
+            content += '<p class="text-muted"><i class="icon-info-circle"></i> Pedido anterior a la versión 1.4.0: no se guardó qué productos se quedaron fuera.</p>';
+        } else {
+            content += '<p class="text-success"><i class="icon-check"></i> Entraron todos los productos.</p>';
+        }
+        return content + '</div></div>';
+    },
+
+    /** Lotes sin pedido madre: misma tabla que la de arriba */
     renderOrphans: function(orphans) {
         var self = this;
         var body = $('#orphans-table tbody');
         body.empty();
+        self.orphans = orphans;
         if (!orphans.length) {
             $('#orphans-container').hide();
             return;
         }
-        orphans.forEach(function(b) {
+        orphans.forEach(function(b, i) {
             body.append('<tr>' +
-                '<td style="white-space:nowrap">' + self.esc(b.date_processed) + '</td>' +
+                '<td><span class="text-muted">Sin pedido</span></td>' +
                 '<td>' + self.esc(b.shop_name) + '</td>' +
-                '<td><small>#' + b.original_ids.join(', #') + '</small></td>' +
-                '<td>' + (b.legacy ? '<small class="text-muted">Anterior a la 1.4.0: líneas del lote</small>' : '') + self.missingList(b.missing) + '</td>' +
+                '<td>' + self.idsCell(b.original_ids, b.original_ids.length) + '</td>' +
+                '<td><a href="#" class="label label-danger" onclick="ProcessedOrders.viewBatchDetails(' + i + '); return false;" title="' + parseInt(b.missing_qty, 10) + ' uds en total">' + parseInt(b.missing_count, 10) + ' ref.</a></td>' +
+                '<td style="white-space:nowrap">' + self.esc(b.date_processed) + '</td>' +
+                '<td><div class="btn-group"><button type="button" class="btn btn-xs btn-info" onclick="ProcessedOrders.viewBatchDetails(' + i + ')" title="Ver detalles"><i class="icon-eye"></i></button></div></td>' +
                 '</tr>');
         });
         $('#orphans-count').text(orphans.length);
         $('#orphans-container').show();
+    },
+
+    /** Detalle de un lote sin pedido madre */
+    viewBatchDetails: function(index) {
+        var self = this;
+        var b = (this.orphans || [])[index];
+        if (!b) {
+            return;
+        }
+        $('#orderDetailsModal').modal('show');
+        $('#orderDetailsContent').html('<div class="text-center"><i class="icon-spinner icon-spin"></i> Cargando detalles...</div>');
+        $.ajax({
+            url: this.adminLink,
+            method: 'GET',
+            data: { action: 'get_batch_details', id_child_shop: b.id_child_shop, batch_date: b.batch_date, token: this.token },
+            dataType: 'json',
+            success: function(response) {
+                if (!response.success || !response.batch) {
+                    $('#orderDetailsContent').html('<div class="alert alert-danger">Error al cargar detalles: ' + self.esc(response.message || 'Error desconocido') + '</div>');
+                    return;
+                }
+                var d = response.batch;
+                var content = '<div class="row"><div class="col-md-12">';
+                content += '<h5><i class="icon-refresh"></i> Lote sin pedido madre</h5>';
+                content += '<table class="table table-condensed">';
+                content += '<tr><td><strong>Tienda Origen:</strong></td><td>' + self.esc(d.shop_name) + '</td></tr>';
+                content += '<tr><td><strong>Pedidos Originales:</strong></td><td><span class="badge badge-info">' + d.original_orders + '</span> <small class="text-muted">' + self.esc(d.original_labels) + '</small></td></tr>';
+                content += '<tr><td><strong>Fecha Sincronización:</strong></td><td>' + self.esc(d.date_sync) + '</td></tr>';
+                content += '<tr><td><strong>Fecha Procesamiento:</strong></td><td>' + self.esc(d.date_processed) + '</td></tr>';
+                content += '</table></div></div>';
+                content += self.missingBlock(d.missing, d.legacy);
+                $('#orderDetailsContent').html(content);
+            },
+            error: function() {
+                $('#orderDetailsContent').html('<div class="alert alert-danger">Error de comunicación al cargar detalles</div>');
+            }
+        });
     },
 
     /**
@@ -406,18 +479,7 @@ var ProcessedOrders = {
         }
         
         // Productos que se quedaron fuera
-        content += '<div class="row"><div class="col-md-12">';
-        if (order.missing && order.missing.length > 0) {
-            content += '<div class="alert alert-danger" style="margin-bottom:0">';
-            content += '<h5 style="margin-top:0"><i class="icon-warning-sign"></i> No importados (' + order.missing.length + '): la referencia no existe en la tienda madre</h5>';
-            content += this.missingList(order.missing);
-            content += '</div>';
-        } else if (order.legacy) {
-            content += '<p class="text-muted"><i class="icon-info-circle"></i> Pedido anterior a la versión 1.4.0: no se guardó qué productos se quedaron fuera.</p>';
-        } else {
-            content += '<p class="text-success"><i class="icon-check"></i> Entraron todos los productos.</p>';
-        }
-        content += '</div></div>';
+        content += this.missingBlock(order.missing, order.legacy && !(order.missing && order.missing.length));
         
         $('#orderDetailsContent').html(content);
     },

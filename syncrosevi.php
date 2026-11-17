@@ -48,7 +48,7 @@ class Syncrosevi extends Module
     {
         $this->name = 'syncrosevi';
         $this->tab = 'administration';
-        $this->version = '1.4.0';
+        $this->version = '1.4.1';
         $this->author = 'josra';
         $this->need_instance = 0;
         $this->ps_versions_compliancy = array(

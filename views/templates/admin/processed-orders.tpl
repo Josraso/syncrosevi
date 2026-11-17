@@ -85,17 +85,21 @@
                 <div id="pagination-container"></div>
                 <div id="pagination-info" class="text-muted"></div>
 
-                <div id="orphans-container" style="display: none; margin-top: 20px;">
-                    <h4><i class="icon-warning-sign"></i> Lotes sin pedido madre <span class="badge" id="orphans-count"></span></h4>
-                    <p class="help-block">Pedidos de la tienda hija en los que no coincidió ninguna referencia con la tienda madre, así que no se creó pedido.</p>
+                <div id="orphans-container" class="panel" style="display: none; margin-top: 20px;">
+                    <div class="panel-heading">
+                        <i class="icon-warning-sign"></i> Lotes sin pedido madre <span class="badge" id="orphans-count"></span>
+                        <small class="text-muted" style="text-transform:none;font-weight:normal;margin-left:8px">Ninguna referencia coincidía con la tienda madre, así que no se creó pedido</small>
+                    </div>
                     <div class="table-responsive">
-                        <table id="orphans-table" class="table table-striped table-condensed">
+                        <table id="orphans-table" class="table table-striped table-hover">
                             <thead>
                                 <tr>
-                                    <th>Fecha</th>
+                                    <th>Pedido Madre</th>
                                     <th>Tienda Origen</th>
-                                    <th>Pedidos de la hija</th>
-                                    <th>Productos fuera</th>
+                                    <th>Pedidos Orig.</th>
+                                    <th title="Productos que no entraron porque su referencia no existe en la tienda madre">Fuera</th>
+                                    <th>Fecha</th>
+                                    <th>Acciones</th>
                                 </tr>
                             </thead>
                             <tbody></tbody>

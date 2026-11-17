@@ -2,7 +2,7 @@
 <module>
     <name>syncrosevi</name>
     <displayName><![CDATA[SyncroSevi - Sincronizaci&oacute;n de Pedidos]]></displayName>
-    <version><![CDATA[1.4.0]]></version>
+    <version><![CDATA[1.4.1]]></version>
     <description><![CDATA[M&oacute;dulo para sincronizar pedidos entre tienda madre e hijas mediante WebService]]></description>
     <author><![CDATA[josra]]></author>
     <tab><![CDATA[administration]]></tab>

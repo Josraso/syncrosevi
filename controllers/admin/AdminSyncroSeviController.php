@@ -101,6 +101,10 @@ class AdminSyncroseviController extends ModuleAdminController
                 $this->getOrderDetailsAjax();
 
                 return;
+            case 'get_batch_details':
+                $this->getBatchDetailsAjax();
+
+                return;
             case 'get_states':
                 $this->getChildShopStatesAjax();
 
@@ -799,11 +803,20 @@ class AdminSyncroseviController extends ModuleAdminController
                 // Lote anterior a la 1.4.0: no se guardó qué entró; se enseñan todas sus líneas
                 $out = $lines;
             }
+            $missing = Syncrosevi::groupMissing($out);
+            $qty = 0;
+            foreach ($missing as $m) {
+                $qty += (int) $m['quantity'];
+            }
             $result[] = array(
+                'id_child_shop' => (int) $b['id_child_shop'],
+                'batch_date' => (string) $b['date_processed'],
                 'shop_name' => $b['shop_name'],
                 'date_processed' => $this->esDate($b['date_processed']),
                 'original_ids' => $ids,
-                'missing' => Syncrosevi::groupMissing($out),
+                'missing' => $missing,
+                'missing_count' => count($missing),
+                'missing_qty' => $qty,
                 'legacy' => $legacy && count($out) === count($lines),
             );
         }
@@ -915,7 +928,7 @@ class AdminSyncroseviController extends ModuleAdminController
                 'order_url' => $this->getOrderAdminUrl($orderId),
                 'products' => $products,
                 'sync_info' => $syncInfo,
-                'missing' => Syncrosevi::groupMissing($missingLines),
+                'missing' => $this->withSimilar(Syncrosevi::groupMissing($missingLines)),
                 'legacy' => $legacy,
             );
 
@@ -1016,6 +1029,131 @@ class AdminSyncroseviController extends ModuleAdminController
 
         fclose($output);
         exit;
+    }
+
+    /**
+     * AJAX: detalle de un lote sin pedido madre (tienda + fecha de proceso)
+     */
+    protected function getBatchDetailsAjax()
+    {
+        try {
+            $idShop = (int) Tools::getValue('id_child_shop');
+            $date = (string) Tools::getValue('batch_date');
+            if (!$idShop || !Validate::isDate($date)) {
+                throw new Exception('Lote no válido');
+            }
+            $db = Db::getInstance();
+            $rows = (array) $db->executeS(
+                'SELECT ot.id_original_order, ot.child_reference, ot.date_sync, cs.name AS shop_name
+                 FROM `' . _DB_PREFIX_ . 'syncrosevi_order_tracking` ot
+                 JOIN `' . _DB_PREFIX_ . 'syncrosevi_child_shops` cs ON ot.id_child_shop = cs.id_child_shop
+                 WHERE ot.id_child_shop = ' . $idShop . ' AND ot.processed = 1 AND ot.is_clone = 0
+                 AND (ot.id_mother_order = 0 OR ot.id_mother_order IS NULL) AND ot.date_processed = "' . pSQL($date) . '"
+                 ORDER BY ot.id_original_order'
+            );
+            if (!$rows) {
+                throw new Exception('Lote no encontrado');
+            }
+            $ids = array_map('intval', array_column($rows, 'id_original_order'));
+            $labels = array();
+            $dateSync = null;
+            foreach ($rows as $r) {
+                $labels[] = '#' . (int) $r['id_original_order'] . ($r['child_reference'] !== '' ? ' (' . $r['child_reference'] . ')' : '');
+                if ($dateSync === null || $r['date_sync'] < $dateSync) {
+                    $dateSync = $r['date_sync'];
+                }
+            }
+            $lines = (array) $db->executeS(
+                'SELECT l.product_reference, l.product_name, l.quantity, l.id_original_order, l.import_status
+                 FROM `' . _DB_PREFIX_ . 'syncrosevi_order_lines` l
+                 WHERE l.id_child_shop = ' . $idShop . ' AND l.id_original_order IN (' . implode(',', $ids) . ')'
+            );
+            $out = array();
+            $legacy = false;
+            foreach ($lines as $line) {
+                $st = (int) $line['import_status'];
+                if ($st === Syncrosevi::LINE_NOT_FOUND || $st === Syncrosevi::LINE_NO_REFERENCE) {
+                    $out[] = $line;
+                } elseif ($st === Syncrosevi::LINE_PENDING) {
+                    $legacy = true;
+                }
+            }
+            if ($legacy && !$out) {
+                $out = $lines;
+            }
+
+            $this->ajaxResponse(true, 'success', array('batch' => array(
+                'shop_name' => $rows[0]['shop_name'],
+                'original_orders' => count($ids),
+                'original_labels' => implode(', ', $labels),
+                'date_sync' => $this->esDate($dateSync),
+                'date_processed' => $this->esDate($date),
+                'missing' => $this->withSimilar(Syncrosevi::groupMissing($out)),
+                'legacy' => $legacy && count($out) === count($lines),
+            )));
+        } catch (Exception $e) {
+            $this->ajaxResponse(false, $e->getMessage());
+        }
+    }
+
+    /** Añade a cada producto fuera las referencias parecidas que sí hay en la madre (solo como pista) */
+    protected function withSimilar(array $missing)
+    {
+        foreach ($missing as &$m) {
+            $m['similar'] = $m['reference'] !== '' ? $this->similarReferences($m['reference']) : array();
+        }
+        unset($m);
+
+        return $missing;
+    }
+
+    /**
+     * Referencias de la madre parecidas a una que no existe: la de la madre empieza igual que la de la hija
+     * (41109 ↔ 41109B), o son iguales sin guiones, espacios ni puntos. Productos y combinaciones, hasta 3.
+     *
+     * @return array lista de array('reference', 'name')
+     */
+    protected function similarReferences($reference)
+    {
+        $reference = trim((string) $reference);
+        if (Tools::strlen($reference) < 3) {
+            return array();
+        }
+        $db = Db::getInstance();
+        $ref = pSQL($reference);
+        $like = str_replace(array('%', '_'), array('\%', '\_'), $ref);
+        $plain = pSQL(preg_replace('/[\s\-\.\/_]+/', '', $reference));
+        $norm = function ($col) {
+            return 'REPLACE(REPLACE(REPLACE(REPLACE(REPLACE(' . $col . ', "-", ""), " ", ""), ".", ""), "/", ""), "_", "")';
+        };
+        $idLang = (int) Configuration::get('PS_LANG_DEFAULT');
+        $idShop = (int) Configuration::get('PS_SHOP_DEFAULT');
+        $len = (int) Tools::strlen($reference);
+        $match = function ($col) use ($ref, $like, $plain, $norm) {
+            return '(' . $col . ' <> "" AND CHAR_LENGTH(' . $col . ') >= 3 AND ('
+                . '"' . $ref . '" LIKE CONCAT(REPLACE(REPLACE(' . $col . ', "%", "\\%"), "_", "\\_"), "%")'
+                . ' OR ' . $col . ' LIKE "' . $like . '%"'
+                . ($plain !== '' ? ' OR ' . $norm($col) . ' = "' . $plain . '"' : '')
+                . '))';
+        };
+        $sql = '(SELECT p.reference AS reference, pl.name AS name, ABS(CHAR_LENGTH(p.reference) - ' . $len . ') AS d
+                 FROM `' . _DB_PREFIX_ . 'product` p
+                 LEFT JOIN `' . _DB_PREFIX_ . 'product_lang` pl ON (pl.id_product = p.id_product AND pl.id_lang = ' . $idLang . ' AND pl.id_shop = ' . $idShop . ')
+                 WHERE ' . $match('p.reference') . ' LIMIT 10)
+                UNION
+                (SELECT pa.reference AS reference, pl.name AS name, ABS(CHAR_LENGTH(pa.reference) - ' . $len . ') AS d
+                 FROM `' . _DB_PREFIX_ . 'product_attribute` pa
+                 LEFT JOIN `' . _DB_PREFIX_ . 'product_lang` pl ON (pl.id_product = pa.id_product AND pl.id_lang = ' . $idLang . ' AND pl.id_shop = ' . $idShop . ')
+                 WHERE ' . $match('pa.reference') . ' LIMIT 10)
+                ORDER BY d ASC, reference ASC
+                LIMIT 3';
+        $rows = $db->executeS($sql);
+        $out = array();
+        foreach ((array) $rows as $r) {
+            $out[] = array('reference' => (string) $r['reference'], 'name' => (string) $r['name']);
+        }
+
+        return $out;
     }
 
     /** Productos fuera en una celda del CSV: REF · nombre · N uds (pedidos #…) | … */
