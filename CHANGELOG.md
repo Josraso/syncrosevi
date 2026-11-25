@@ -1,5 +1,11 @@
 # Changelog — SyncroSevi
 
+## 1.4.2 — 2026-11-25
+- El cron por URL (webhook `sync` y `process`) recibe la respuesta al momento («Recibido») y la sincronización sigue en segundo plano. Se acaba el «Status: 503 Service Temporarily Unavailable» de Plesk en las pasadas largas, que salía aunque la sincronización se hacía bien.
+- No pueden ir dos pasadas del webhook a la vez: si llega otra mientras una trabaja, contesta «ya hay una en marcha», no hace nada y lo apunta en el registro. Evita pedidos madre repetidos si una pasada se alarga.
+- El resultado de cada pasada sigue quedando en el registro del módulo, como siempre. Para ver el resultado completo en la respuesta (como antes), añade `&wait=1` a la URL.
+- No cambia nada de cómo sincroniza ni procesa, ni los botones del panel, ni el cron por línea de comandos, ni el aviso en tiempo real de las tiendas hijas.
+
 ## 1.4.1 — 2026-11-17
 - Pedidos procesados: los lotes sin pedido madre salen en una tabla igual que la de pedidos (tienda, pedidos de la hija, «Fuera», fecha) con el botón de ver detalle, en vez del resumen de texto.
 - La ventana de detalle muestra los no importados en una tabla (referencia, producto, unidades, pedidos de la hija).

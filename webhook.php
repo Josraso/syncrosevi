@@ -35,5 +35,8 @@ if (!$module || !Module::isInstalled('syncrosevi')) {
 
 @set_time_limit(300);
 $result = $module->handleWebhookRequest();
+if (method_exists($module, 'webhookResponded') && $module->webhookResponded()) {
+    exit;
+}
 http_response_code((int) $result[0]);
 echo json_encode($result[1]);

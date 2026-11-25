@@ -44,11 +44,17 @@ class Syncrosevi extends Module
     /** Mientras se crea un clon o se aplica un estado venido de la hija, la madre no avisa a la hija (evita rebotes) */
     public static $noPush = 0;
 
+    /** true cuando el webhook ya ha contestado al cron y sigue trabajando después (sync/process) */
+    private $webhookResponded = false;
+
+    /** Bloqueo para que no vayan dos sincronizaciones o procesamientos del webhook a la vez */
+    private $webhookLock = null;
+
     public function __construct()
     {
         $this->name = 'syncrosevi';
         $this->tab = 'administration';
-        $this->version = '1.4.1';
+        $this->version = '1.4.2';
         $this->author = 'josra';
         $this->need_instance = 0;
         $this->ps_versions_compliancy = array(
@@ -1296,7 +1302,17 @@ class Syncrosevi extends Module
         try {
             switch ($action) {
                 case 'sync':
-                    $results = $this->syncOrders();
+                    if (!$this->lockWebhook()) {
+                        return array(200, $this->webhookBusy('sync'));
+                    }
+                    $this->respondEarly('sync');
+                    try {
+                        $results = $this->syncOrders();
+                    } catch (Exception $e) {
+                        $this->unlockWebhook();
+                        throw $e;
+                    }
+                    $this->unlockWebhook();
 
                     return array(200, array(
                         'success' => true,
@@ -1308,7 +1324,17 @@ class Syncrosevi extends Module
 
                 case 'process':
                     $batchLimit = (int) Configuration::get('SYNCROSEVI_BATCH_LIMIT') ?: 10;
-                    $results = $this->processOrders($batchLimit);
+                    if (!$this->lockWebhook()) {
+                        return array(200, $this->webhookBusy('process'));
+                    }
+                    $this->respondEarly('process');
+                    try {
+                        $results = $this->processOrders($batchLimit);
+                    } catch (Exception $e) {
+                        $this->unlockWebhook();
+                        throw $e;
+                    }
+                    $this->unlockWebhook();
 
                     return array(200, array(
                         'success' => true,
@@ -1373,6 +1399,11 @@ class Syncrosevi extends Module
                     throw new Exception('Invalid action: ' . $action . '. Valid actions: sync, process, realtime_sync, test');
             }
         } catch (Exception $e) {
+            if ($this->webhookResponded) {
+                // el cron ya tiene su respuesta: el fallo solo puede quedar en el registro
+                $this->log('✗ Webhook ' . $action . ' (en segundo plano): ' . $e->getMessage());
+            }
+
             return array(500, array(
                 'success' => false,
                 'error' => $e->getMessage(),
@@ -1380,6 +1411,102 @@ class Syncrosevi extends Module
                 'timestamp' => date('Y-m-d H:i:s'),
             ));
         }
+    }
+
+    /**
+     * ¿El webhook ya ha contestado al cron? Entonces quien lo llama no debe enviar nada más.
+     */
+    public function webhookResponded()
+    {
+        return $this->webhookResponded;
+    }
+
+    /**
+     * Contesta ya al cron («recibido») y deja que PHP siga con la sincronización o el procesamiento.
+     * Así el servidor web (proxy de Plesk) no corta la espera con un 503 en las pasadas largas.
+     * Con &wait=1 en la URL no se adelanta la respuesta y se devuelve el resultado completo, como antes.
+     */
+    private function respondEarly($action)
+    {
+        if (Tools::getValue('wait') || php_sapi_name() === 'cli' || headers_sent()) {
+            return;
+        }
+
+        @ignore_user_abort(true);
+        $body = json_encode(array(
+            'success' => true,
+            'action' => $action,
+            'accepted' => true,
+            'message' => 'Recibido: se está ejecutando en segundo plano. El resultado queda en el registro de SyncroSevi.',
+            'timestamp' => date('Y-m-d H:i:s'),
+        ));
+
+        while (ob_get_level() > 0) {
+            @ob_end_clean();
+        }
+        http_response_code(200);
+        header('Content-Type: application/json; charset=utf-8');
+        header('Cache-Control: no-store, no-cache, must-revalidate');
+        header('X-Robots-Tag: noindex, nofollow');
+        header('Content-Length: ' . strlen($body));
+        header('Connection: close');
+        echo $body;
+        @flush();
+
+        if (function_exists('fastcgi_finish_request')) {
+            @fastcgi_finish_request();
+        } elseif (function_exists('litespeed_finish_request')) {
+            @litespeed_finish_request();
+        }
+        $this->webhookResponded = true;
+    }
+
+    /**
+     * Bloqueo de las pasadas del webhook (sync y process comparten uno): si ya hay una en marcha,
+     * la nueva no hace nada. Se suelta solo si PHP termina o se cae.
+     */
+    private function lockWebhook()
+    {
+        $dir = dirname(__FILE__) . '/logs';
+        if (!is_dir($dir)) {
+            @mkdir($dir, 0755, true);
+            self::protectDir($dir);
+        }
+        $handle = @fopen($dir . '/webhook.lock', 'c');
+        if (!$handle) {
+            // sin poder crear el archivo de bloqueo se sigue como antes
+            return true;
+        }
+        if (!flock($handle, LOCK_EX | LOCK_NB)) {
+            fclose($handle);
+
+            return false;
+        }
+        $this->webhookLock = $handle;
+
+        return true;
+    }
+
+    private function unlockWebhook()
+    {
+        if ($this->webhookLock) {
+            @flock($this->webhookLock, LOCK_UN);
+            @fclose($this->webhookLock);
+            $this->webhookLock = null;
+        }
+    }
+
+    private function webhookBusy($action)
+    {
+        $this->log('Webhook ' . $action . ' saltado: ya hay una sincronización o un procesamiento en marcha');
+
+        return array(
+            'success' => true,
+            'action' => $action,
+            'busy' => true,
+            'message' => 'Ya hay una sincronización o un procesamiento en marcha: esta llamada no hace nada.',
+            'timestamp' => date('Y-m-d H:i:s'),
+        );
     }
 
     /**

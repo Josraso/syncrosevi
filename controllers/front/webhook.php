@@ -41,6 +41,10 @@ class SyncroseviWebhookModuleFrontController extends ModuleFrontController
     {
         @set_time_limit(300);
         $result = $this->module->handleWebhookRequest();
+        if ($this->module->webhookResponded()) {
+            // sync/process: el cron ya tiene su respuesta y el trabajo ha terminado
+            exit;
+        }
         $this->sendJson($result[0], $result[1]);
     }
 
