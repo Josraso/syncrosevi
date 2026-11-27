@@ -54,7 +54,7 @@ class Syncrosevi extends Module
     {
         $this->name = 'syncrosevi';
         $this->tab = 'administration';
-        $this->version = '1.4.2';
+        $this->version = '1.4.3';
         $this->author = 'josra';
         $this->need_instance = 0;
         $this->ps_versions_compliancy = array(
@@ -1302,7 +1302,7 @@ class Syncrosevi extends Module
         try {
             switch ($action) {
                 case 'sync':
-                    if (!$this->lockWebhook()) {
+                    if (!$this->lockWebhook('sync')) {
                         return array(200, $this->webhookBusy('sync'));
                     }
                     $this->respondEarly('sync');
@@ -1324,7 +1324,7 @@ class Syncrosevi extends Module
 
                 case 'process':
                     $batchLimit = (int) Configuration::get('SYNCROSEVI_BATCH_LIMIT') ?: 10;
-                    if (!$this->lockWebhook()) {
+                    if (!$this->lockWebhook('process')) {
                         return array(200, $this->webhookBusy('process'));
                     }
                     $this->respondEarly('process');
@@ -1462,17 +1462,18 @@ class Syncrosevi extends Module
     }
 
     /**
-     * Bloqueo de las pasadas del webhook (sync y process comparten uno): si ya hay una en marcha,
-     * la nueva no hace nada. Se suelta solo si PHP termina o se cae.
+     * Bloqueo de las pasadas del webhook, uno por acción: si ya hay otra pasada de la misma acción
+     * en marcha, la nueva no hace nada. sync y process pueden ir a la vez (los crons de las 3:00
+     * saltan juntos), como antes de la 1.4.2. Se suelta solo si PHP termina o se cae.
      */
-    private function lockWebhook()
+    private function lockWebhook($action)
     {
         $dir = dirname(__FILE__) . '/logs';
         if (!is_dir($dir)) {
             @mkdir($dir, 0755, true);
             self::protectDir($dir);
         }
-        $handle = @fopen($dir . '/webhook.lock', 'c');
+        $handle = @fopen($dir . '/webhook-' . ($action === 'process' ? 'process' : 'sync') . '.lock', 'c');
         if (!$handle) {
             // sin poder crear el archivo de bloqueo se sigue como antes
             return true;
@@ -1498,13 +1499,14 @@ class Syncrosevi extends Module
 
     private function webhookBusy($action)
     {
-        $this->log('Webhook ' . $action . ' saltado: ya hay una sincronización o un procesamiento en marcha');
+        $que = $action === 'process' ? 'un procesamiento' : 'una sincronización';
+        $this->log('Webhook ' . $action . ' saltado: ya hay ' . $que . ' en marcha');
 
         return array(
             'success' => true,
             'action' => $action,
             'busy' => true,
-            'message' => 'Ya hay una sincronización o un procesamiento en marcha: esta llamada no hace nada.',
+            'message' => 'Ya hay ' . $que . ' en marcha: esta llamada no hace nada.',
             'timestamp' => date('Y-m-d H:i:s'),
         );
     }

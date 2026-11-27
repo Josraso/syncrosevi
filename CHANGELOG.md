@@ -1,5 +1,9 @@
 # Changelog — SyncroSevi
 
+## 1.4.3 — 2026-11-27
+- Vuelven a saltar solos los crons de la noche. Desde la 1.4.2, traer pedidos (`sync`) y consolidar (`process`) compartían el mismo bloqueo: si los dos crons saltaban a la vez, el segundo veía «ya hay una en marcha» y no hacía nada. Al lanzarlos a mano de uno en uno sí funcionaban.
+- Ahora cada uno tiene su propio bloqueo: pueden ir a la vez, como antes de la 1.4.2, y lo único que se evita es que vayan dos pasadas de la misma acción a la vez.
+
 ## 1.4.2 — 2026-11-25
 - El cron por URL (webhook `sync` y `process`) recibe la respuesta al momento («Recibido») y la sincronización sigue en segundo plano. Se acaba el «Status: 503 Service Temporarily Unavailable» de Plesk en las pasadas largas, que salía aunque la sincronización se hacía bien.
 - No pueden ir dos pasadas del webhook a la vez: si llega otra mientras una trabaja, contesta «ya hay una en marcha», no hace nada y lo apunta en el registro. Evita pedidos madre repetidos si una pasada se alarga.
